@@ -7,7 +7,7 @@ from kademlia.storage import IStorage
 
 from core.shared import env
 
-
+KEY_SIZE = env.Vars.KEY_SIZE
 
 class MIH_Storage(IStorage):
     def __init__(self, ttl=604800, m=4):
@@ -16,29 +16,43 @@ class MIH_Storage(IStorage):
         self.m = m
         self.pieces = [defaultdict(set) for _ in range(m)]
 
+        base, rem = divmod(KEY_SIZE, m)
+        self._piece_sizes = [base + 1 if i < rem else base for i in range(m)]
+        self._piece_offsets = []
+        acc = 0
+        for size in self._piece_sizes:
+            self._piece_offsets.append(acc)
+            acc += size 
+
     def shuffle_bits(self, key: bytes):
+        total_bits = len(key) * 8
+        bits = [0] * total_bits
         read = 0
-        r = [-1 for _ in range(env.Vars[env.ConfigNames.KEY_SIZE])]
         for byte in key:
             for i in range(7, -1, -1):
-                bucket = i % self.m
+                bucket = read % self.m
                 current = read // self.m
-                r[current + bucket] = byte[i]
-        return r
+                pos = self._piece_offsets[bucket] + current
+                bits[pos] = (byte >> i) & 1
+                read += 1
+
+        out = bytearray(len(key))
+        for idx, bit in enumerate(bits):
+            if bit:
+                out[idx // 8] |= 1 << (7 - idx % 8)
+        return bytes(out)
 
 
     def _split(self, key: bytes):
         total_bits = len(key) * 8
-        assert total_bits % self.m == 0, (
-            f"key of {total_bits} bits is not divisible by m={self.m}"
-        )
-        piece_bits = total_bits // self.m
-        mask = (1 << piece_bits) - 1
         value = int.from_bytes(key, "big")
-        return [
-            (value >> (total_bits - ((i + 1) * piece_bits))) & mask
-            for i in range(self.m)
-        ]
+        pieces = []
+        offset_from_end = total_bits
+        for size in self._piece_sizes:
+            offset_from_end -= size
+            mask = (1 << size) - 1
+            pieces.append((value >> offset_from_end) & mask)
+        return pieces
 
     def _index(self, key: bytes):
         for i, piece in enumerate(self._split(key)):
@@ -64,7 +78,7 @@ class MIH_Storage(IStorage):
         self.data[key] = (time.monotonic(), values)
         if is_new:
             self._index(key)
-        self.cull()
+        
 
     def snapshot(self):
         now = time.monotonic()
@@ -104,14 +118,13 @@ class MIH_Storage(IStorage):
 
     def get(self, key, default=None):
         key = self.shuffle_bits(key)
-        self.cull()
+        
         if key in self.data:
             return self[key]
         return default
 
     def __getitem__(self, key):
-        key = self.shuffle_bits(key)
-        self.cull()
+        
         return self.data[key][1]
 
     def get_by_hamming(self, query: bytes, r: int, trace=None, trace_prefix="mih"):
@@ -120,7 +133,7 @@ class MIH_Storage(IStorage):
             raise ValueError("r must be >= 0")
 
         start = time.perf_counter()
-        self.cull()
+        
         if trace is not None:
             trace.step(f"{trace_prefix}.cull", start, entries=len(self.data))
 
@@ -179,7 +192,7 @@ class MIH_Storage(IStorage):
         return sum((x ^ y).bit_count() for x, y in zip(a, b))
 
     def __repr__(self):
-        self.cull()
+        
         return repr(self.data)
 
     def iter_older_than(self, seconds_old):
@@ -199,7 +212,7 @@ class MIH_Storage(IStorage):
         return zip(ikeys, ibirthday, ivalues)
 
     def __iter__(self):
-        self.cull()
+        
         return (
             (key, value)
             for key, (_, values) in self.data.items()
