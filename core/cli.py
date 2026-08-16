@@ -83,7 +83,6 @@ async def main():
 
       case "get_near_files":  # nome do arquivo, tamanho do embedding em bits, raio
         await get_near(client, command)
-
       case _:
         print(f"Unknown command: {command[0]}")
 

@@ -3,6 +3,7 @@ Package for interacting on the network at a high level.
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import pickle
 import random
@@ -33,7 +34,17 @@ class Server:
 
     protocol_class = KademliaProtocol
 
-    def __init__(self, ksize=20, replication_factor=3, alpha=3, node_id:bytes=None, key_size_bits=128, storage=None):
+    def __init__(
+        self,
+        ksize=20,
+        replication_factor=3,
+        alpha=3,
+        node_id: bytes = None,
+        key_size_bits=128,
+        storage=None,
+        hamming_workers=4,
+        hamming_max_concurrency=8,
+    ):
         """
         Create a server instance.  This will start listening on the given port.
 
@@ -59,6 +70,11 @@ class Server:
         self.protocol = None
         self.refresh_loop = None
         self.save_state_loop = None
+        self._hamming_executor = ThreadPoolExecutor(
+            max_workers=hamming_workers,
+            thread_name_prefix="kademlia-hamming",
+        )
+        self._hamming_sem = asyncio.Semaphore(hamming_max_concurrency)
 
     def stop(self):
         if self.transport is not None:
@@ -69,6 +85,8 @@ class Server:
 
         if self.save_state_loop:
             self.save_state_loop.cancel()
+
+        self._hamming_executor.shutdown(wait=False, cancel_futures=True)
 
     def _create_protocol(self):
         protocol = self.protocol_class(self.node, self.storage, self.ksize)
@@ -195,11 +213,19 @@ class Server:
         start = time.perf_counter()
         local_results = []
         if hasattr(self.storage, "get_by_hamming"):
+            loop = asyncio.get_running_loop()
+            async with self._hamming_sem:
+                raw_local_results = await loop.run_in_executor(
+                    self._hamming_executor,
+                    self.storage.get_by_hamming,
+                    dkey,
+                    r,
+                    timer if trace else None,
+                    "local_mih",
+                )
             local_results = [
                 (found_key.hex(), value, distance)
-                for found_key, value, distance in self.storage.get_by_hamming(
-                    dkey, r, trace=timer if trace else None, trace_prefix="local_mih"
-                )
+                for found_key, value, distance in raw_local_results
             ]
         timer.step("network.local_hamming", start, results=len(local_results))
 

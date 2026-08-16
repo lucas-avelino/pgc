@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--projection-seed", default=42, type=int, help="Seed for deterministic projections.")
     parser.add_argument("--extensions", nargs="*", default=sorted(IMAGE_EXTENSIONS), help="Allowed image extensions.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing .bin files.")
+    parser.add_argument("--mode", default='hamming', choices=["hamming", "continous"])
 
     return parser.parse_args()
 

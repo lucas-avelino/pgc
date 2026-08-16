@@ -1,23 +1,35 @@
 from aiohttp import web
-import kademlia
+from kademlia.network import Server
+
+async def public_listen(port: int, server: Server):
+    listener = NodeHTTPListener(port, server)
+    await listener.start()
+    return listener
+
 
 class NodeHTTPListener:
-    async def __init__(self, port: int, server: kademlia.network.Server):
+    def __init__(self, port: int, server: Server):
       self.server = server
+      self.port = port
+      self.app = web.Application()
 
-      app = web.Application()
 
-      app.router.add_get("/get", self.get)
-      app.router.add_get("/get_near", self.get_near)
-      app.router.add_post("/put", self.put)
+      self.app.router.add_get("/get", self.get)
+      self.app.router.add_get("/get_near", self.get_near)
+      self.app.router.add_post("/put", self.put)
   
-      # Use AppRunner to avoid blocking the event loop
-      runner = web.AppRunner(app)
-      await runner.setup()
-      site = web.TCPSite(runner, '0.0.0.0', port)
-      await site.start()
-      print(f"HTTP server started successfully on port {port}")
 
+    async def start(self):
+        print(f"Starting HTTP server on port {self.port}")
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, '0.0.0.0', self.port)
+        await site.start()
+        print(f"HTTP server started successfully on port {self.port}")
+
+    async def stop(self):
+        if self.runner:
+            await self.runner.cleanup()
 
     async def get(self, request):
       try:

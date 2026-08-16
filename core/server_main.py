@@ -4,8 +4,13 @@ from kademlia.network import Server
 
 from shared import env
 from server.state import states
+from server.metric_reporter import report_metrics
+from server.healer import heal_bootstrap
+from server.http_listener import public_listen
 
 port = -1
+KEY_SIZE_BITS = env.Vars.KEY_SIZE
+
 
 async def main():
     state = states.State(key_size_bits=KEY_SIZE_BITS, persist_path=env.Vars.PERSIST_PATH)
@@ -31,7 +36,7 @@ async def main():
     try:
         if env.Vars.BOOTSTRAP_ADDR:
             await try_bootstrap(server)
-            heal_task = asyncio.create_task(heal_bootstrap(server))
+            heal_task = asyncio.create_task(heal_bootstrap(server, try_bootstrap))
         if env.Vars.METRICS_REPORT_INTERVAL > 0:
             metric_task = asyncio.create_task(report_metrics(server))
         if env.Vars.ENABLE_HTTP:
@@ -65,3 +70,16 @@ async def listen(server: Server) -> int:
             if not env.Vars.AUTOCALC_PORT:
                 raise
             port += 1
+
+async def try_bootstrap(server: Server) -> bool:
+    try:
+        neighbors = await server.bootstrap([env.Vars.BOOTSTRAP_ADDR])
+    except Exception as exc:
+        print(f"Bootstrap failed via {env.Vars.BOOTSTRAP_ADDR}: {exc}")
+        return False
+
+    print(
+        f"Bootstrap via {env.Vars.BOOTSTRAP_ADDR} found "
+        f"{len(neighbors)} neighbors"
+    )
+    return True

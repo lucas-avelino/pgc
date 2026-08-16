@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>COCO Viewer</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        #controls {
+            margin: 15px 0;
+        }
+
+        #gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 15px;
+        }
+
+        .card {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #f5f5f5;
+        }
+
+        .card img {
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            object-fit: cover;
+            display: block;
+            background: #ddd;
+        }
+
+        .info {
+            padding: 8px;
+            font-size: 13px;
+        }
+
+        .info p {
+            margin: 3px 0;
+        }
+
+        button {
+            padding: 8px 14px;
+            margin: 3px;
+            cursor: pointer;
+        }
+
+        #pageInfo {
+            margin: 0 10px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <input type="file" id="jsonFile" accept=".json">
+
+    <div id="controls" style="display:none;">
+        <button id="prev">Anterior</button>
+        <span id="pageInfo"></span>
+        <button id="next">Próxima</button>
+    </div>
+
+    <div id="gallery"></div>
+
+    <script>
+        let data = [];
+        let currentPage = 0;
+
+        const PAGE_SIZE = 100;
+
+        const fileInput = document.getElementById("jsonFile");
+        const gallery = document.getElementById("gallery");
+        const controls = document.getElementById("controls");
+        const pageInfo = document.getElementById("pageInfo");
+
+        fileInput.addEventListener("change", async (event) => {
+            const file = event.target.files[0];
+
+            if (!file)
+                return;
+
+            const text = await file.text();
+
+            try {
+                data = JSON.parse(text);
+            } catch (error) {
+                alert("JSON inválido");
+                return;
+            }
+
+            currentPage = 0;
+
+            controls.style.display = "block";
+
+            renderPage();
+        });
+
+        function renderPage() {
+            gallery.innerHTML = "";
+
+            const start = currentPage * PAGE_SIZE;
+            const end = Math.min(start + PAGE_SIZE, data.length);
+
+            for (let i = start; i < end; i++) {
+
+                const item = data[i];
+
+                const filename = item.value.replace(/\.bin$/, "");
+
+                const imageUrl =
+                    `http://images.cocodataset.org/train2017/${filename}`;
+
+                const card = document.createElement("div");
+                card.className = "card";
+
+                card.innerHTML = `
+                    <img
+                        src="${imageUrl}"
+                        loading="lazy"
+                        alt="${filename}"
+                    >
+
+                    <div class="info">
+                        <strong>${filename}</strong>
+                        <p>Distance: ${item.total_distance}</p>
+                        <p>Close keys: ${item.amount_of_close_keys}</p>
+                    </div>
+                `;
+
+                gallery.appendChild(card);
+            }
+
+            const totalPages = Math.ceil(data.length / PAGE_SIZE);
+
+            pageInfo.textContent =
+                `Página ${currentPage + 1} / ${totalPages} — ${data.length} imagens`;
+
+            document.getElementById("prev").disabled =
+                currentPage === 0;
+
+            document.getElementById("next").disabled =
+                currentPage >= totalPages - 1;
+        }
+
+        document.getElementById("prev").addEventListener("click", () => {
+            if (currentPage > 0) {
+                currentPage--;
+                renderPage();
+                window.scrollTo(0, 0);
+            }
+        });
+
+        document.getElementById("next").addEventListener("click", () => {
+            const totalPages = Math.ceil(data.length / PAGE_SIZE);
+
+            if (currentPage < totalPages - 1) {
+                currentPage++;
+                renderPage();
+                window.scrollTo(0, 0);
+            }
+        });
+    </script>
+
+</body>
+</html>

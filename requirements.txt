@@ -1,0 +1,8 @@
+-e ./kademlia-lib
+aiohttp
+numpy
+requests
+open_clip_torch
+torch
+pillow
+tqdm
