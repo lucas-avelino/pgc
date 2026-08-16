@@ -1,0 +1,207 @@
+import operator
+import time
+from itertools import takewhile
+from collections import OrderedDict, defaultdict
+
+from kademlia.storage import IStorage
+
+from core.shared import env
+
+
+
+class MIH_Storage(IStorage):
+    def __init__(self, ttl=604800, m=4):
+        self.data = OrderedDict()
+        self.ttl = ttl
+        self.m = m
+        self.pieces = [defaultdict(set) for _ in range(m)]
+
+    def shuffle_bits(self, key: bytes):
+        read = 0
+        r = [-1 for _ in range(env.Vars[env.ConfigNames.KEY_SIZE])]
+        for byte in key:
+            for i in range(7, -1, -1):
+                bucket = i % self.m
+                current = read // self.m
+                r[current + bucket] = byte[i]
+        return r
+
+
+    def _split(self, key: bytes):
+        total_bits = len(key) * 8
+        assert total_bits % self.m == 0, (
+            f"key of {total_bits} bits is not divisible by m={self.m}"
+        )
+        piece_bits = total_bits // self.m
+        mask = (1 << piece_bits) - 1
+        value = int.from_bytes(key, "big")
+        return [
+            (value >> (total_bits - ((i + 1) * piece_bits))) & mask
+            for i in range(self.m)
+        ]
+
+    def _index(self, key: bytes):
+        for i, piece in enumerate(self._split(key)):
+            self.pieces[i][piece].add(key)
+
+    def _deindex(self, key: bytes):
+        for i, piece in enumerate(self._split(key)):
+            bucket = self.pieces[i].get(piece)
+            if bucket is not None:
+                bucket.discard(key)
+                if not bucket:
+                    del self.pieces[i][piece]
+
+    def __setitem__(self, key, value):
+        key = self.shuffle_bits(key)
+        is_new = key not in self.data
+        if key in self.data:
+            _, values = self.data.pop(key)
+            if value not in values:
+                values.append(value)
+        else:
+            values = [value]
+        self.data[key] = (time.monotonic(), values)
+        if is_new:
+            self._index(key)
+        self.cull()
+
+    def snapshot(self):
+        now = time.monotonic()
+        return {
+            "ttl": self.ttl,
+            "m": self.m,
+            "entries": [
+                {
+                    "key": key,
+                    "age": max(0, now - birthday),
+                    "values": values,
+                }
+                for key, (birthday, values) in self.data.items()
+            ],
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot, reset_age=False):
+        storage = cls(ttl=snapshot.get("ttl", 604800), m=snapshot.get("m", 4))
+        now = time.monotonic()
+        for entry in snapshot.get("entries", []):
+            key = entry["key"]
+            values = entry.get("values", [])
+            if not values:
+                continue
+            birthday = now if reset_age else now - entry.get("age", 0)
+            storage.data[key] = (birthday, list(values))
+            storage._index(key)
+        storage.cull()
+        return storage
+
+    def cull(self):
+        for key, _ in self.iter_older_than(self.ttl):
+            self._deindex(key)
+            if key in self.data:
+                del self.data[key]
+
+    def get(self, key, default=None):
+        key = self.shuffle_bits(key)
+        self.cull()
+        if key in self.data:
+            return self[key]
+        return default
+
+    def __getitem__(self, key):
+        key = self.shuffle_bits(key)
+        self.cull()
+        return self.data[key][1]
+
+    def get_by_hamming(self, query: bytes, r: int, trace=None, trace_prefix="mih"):
+        query = self.shuffle_bits(query)
+        if r < 0:
+            raise ValueError("r must be >= 0")
+
+        start = time.perf_counter()
+        self.cull()
+        if trace is not None:
+            trace.step(f"{trace_prefix}.cull", start, entries=len(self.data))
+
+        start = time.perf_counter()
+        if r >= self.m:
+            candidates = set(self.data.keys())
+            candidate_source = "full_scan"
+        else:
+            candidates = set()
+            for i, piece in enumerate(self._split(query)):
+                candidates |= self.pieces[i].get(piece, set())
+            candidate_source = "mih_buckets"
+        if trace is not None:
+            trace.step(
+                f"{trace_prefix}.candidate_selection",
+                start,
+                source=candidate_source,
+                candidates=len(candidates),
+                partitions=self.m,
+            )
+
+        start = time.perf_counter()
+        results = {}
+        comparisons = 0
+        for key in candidates:
+            entry = self.data.get(key)
+            if entry is None:
+                continue
+            comparisons += 1
+            d = self._hamming(query, key)
+            if d <= r:
+                current = results.get(key)
+                if current is None or d < current[1]:
+                    results[key] = (entry[1], d)
+        if trace is not None:
+            trace.step(
+                f"{trace_prefix}.hamming_filter",
+                start,
+                comparisons=comparisons,
+                matched_keys=len(results),
+            )
+
+        start = time.perf_counter()
+        output = []
+        for key, (values, distance) in sorted(
+            results.items(), key=lambda item: item[1][1]
+        ):
+            output.extend((key, value, distance) for value in values)
+        if trace is not None:
+            trace.step(f"{trace_prefix}.expand_values", start, results=len(output))
+        return output
+
+    @staticmethod
+    def _hamming(a: bytes, b: bytes) -> int:
+        assert len(a) == len(b), "keys must have the same size"
+        return sum((x ^ y).bit_count() for x, y in zip(a, b))
+
+    def __repr__(self):
+        self.cull()
+        return repr(self.data)
+
+    def iter_older_than(self, seconds_old):
+        min_birthday = time.monotonic() - seconds_old
+        zipped = self._triple_iter()
+        matches = takewhile(lambda r: min_birthday >= r[1], zipped)
+        return [
+            (key, value)
+            for key, _, values in matches
+            for value in values
+        ]
+
+    def _triple_iter(self):
+        ikeys = self.data.keys()
+        ibirthday = map(operator.itemgetter(0), self.data.values())
+        ivalues = map(operator.itemgetter(1), self.data.values())
+        return zip(ikeys, ibirthday, ivalues)
+
+    def __iter__(self):
+        self.cull()
+        return (
+            (key, value)
+            for key, (_, values) in self.data.items()
+            for value in values
+        )

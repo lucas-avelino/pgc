@@ -4,9 +4,10 @@ from datetime import datetime
 import json
 import re
 
-from utils.client import Client
-from utils.embedding_reader import embedding_file_to_keys
-from utils.utils import write_file, write_json
+from core.utils.consumer import Client
+from core.utils.embedding_reader import embedding_file_to_keys
+from core.utils.utils import write_file, write_json
+from core.utils.fill import store_chunks
 
 async def get_near(client: Client, command: [str]):
   start_time = datetime.now()
@@ -56,19 +57,16 @@ async def get_near(client: Client, command: [str]):
   print(f"Time taken to process requests: {request_time - read_file_time}")
 
 async def main():
-  client = Client(urls=["http://localhost:5000","http://localhost:5001","http://localhost:5002","http://localhost:5003","http://localhost:5004"])
+  urls = [f"http://localhost:{i}" for i in range(5000, 5127)]
+  client = Client(urls=urls)
 
   command = input("> ").split(" ")
   while command[0] != "exit":
     match command[0]:
       case "fill":
-        from core.tools.utils.fill import store_chunks
         base_path = command[1]
-        base_url = command[2]
-        amount_of_urls = int(command[3])
-        limit = int(command[4]) if len(command) > 4 else 1000000
-        hash_size_bits = int(command[5]) if len(command) > 5 else 64
-        urls = [f"{base_url}:{port}" for port in range(5000, 5000 + amount_of_urls)]
+        limit = int(command[2]) if len(command) > 2 else 1000000
+        hash_size_bits = int(command[3]) if len(command) > 3 else 64
         print(f"Storing chunks from {base_path} to {urls} with limit {limit} and hash size {hash_size_bits} bits.")
         await store_chunks(base_path, urls, hard_limit=limit, hash_size_bits=hash_size_bits)
 
