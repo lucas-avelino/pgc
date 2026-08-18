@@ -45,3 +45,4 @@ class Vars:
   PERSIST_SAVE_INTERVAL: int = int(os.getenv(ConfigNames.PERSIST_SAVE_INTERVAL) or '5')
   BOOTSTRAP_HEAL_INTERVAL: int = int(os.getenv(ConfigNames.BOOTSTRAP_HEAL_INTERVAL) or '10')
   KEY_SIZE: int = 64
+  SERVER_COUNT = 128

@@ -1,9 +1,11 @@
+import asyncio
 import os
 import pickle
 import random
 
-from data_structures.MIH import MIH_Storage
-from state.slots import SlotResult, try_aquire_any_slot_or_create
+from core.shared import env
+from core.server.data_structures.MIH import MIH_Storage
+from core.server.state.slots import SlotResult, try_aquire_any_slot_or_create
 
 class State:
     node_id: bytes
@@ -58,4 +60,7 @@ class State:
         except Exception:
             print(f"Error saving state to slot {self.slot_info.path}.")
 
-    
+async def persist_regularly(state: State):
+    while True:
+        await asyncio.sleep(env.Vars.PERSIST_SAVE_INTERVAL)
+        state.save_state()

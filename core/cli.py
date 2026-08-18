@@ -7,7 +7,7 @@ import re
 from core.utils.consumer import Client
 from core.utils.embedding_reader import embedding_file_to_keys
 from core.utils.utils import write_file, write_json
-from core.utils.fill import store_chunks
+from core.utils.fill import retry_failed_requests, store_chunks
 
 async def get_near(client: Client, command: [str]):
   start_time = datetime.now()
@@ -67,8 +67,14 @@ async def main():
         base_path = command[1]
         limit = int(command[2]) if len(command) > 2 else 1000000
         hash_size_bits = int(command[3]) if len(command) > 3 else 64
-        print(f"Storing chunks from {base_path} to {urls} with limit {limit} and hash size {hash_size_bits} bits.")
-        await store_chunks(base_path, urls, hard_limit=limit, hash_size_bits=hash_size_bits)
+        failure_report_path = command[4] if len(command) > 4 else "fill_failed_requests.json"
+        await store_chunks(
+          base_path,
+          urls,
+          hard_limit=limit,
+          hash_size_bits=hash_size_bits,
+          failure_report_path=failure_report_path,
+        )
 
       case "get_key":
         result = await client.get(command[1])
@@ -83,6 +89,12 @@ async def main():
 
       case "get_near_files":  # nome do arquivo, tamanho do embedding em bits, raio
         await get_near(client, command)
+      case "retry_failed" | "retry_failed_requests":
+        report_path = command[1] if len(command) > 1 else "fill_failed_requests.json"
+        output_report_path = command[2] if len(command) > 2 else None
+        result = retry_failed_requests(report_path, output_report_path=output_report_path)
+        print(f"Retry summary: {result['submitted']} submitted, {result['successful']} successful, {result['failed']} failed")
+        print(f"Retry failures report: {result['report_path']}")
       case _:
         print(f"Unknown command: {command[0]}")
 

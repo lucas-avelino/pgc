@@ -2,11 +2,11 @@ import asyncio
 
 from kademlia.network import Server
 
-from shared import env
-from server.state import states
-from server.metric_reporter import report_metrics
-from server.healer import heal_bootstrap
-from server.http_listener import public_listen
+from core.shared import env
+from core.server.state import states
+from core.server.metric_reporter import report_metrics
+from core.server.healer import heal_bootstrap
+from core.server.http_listener import public_listen
 
 port = -1
 KEY_SIZE_BITS = env.Vars.KEY_SIZE
@@ -43,7 +43,7 @@ async def main():
             http_task = asyncio.create_task(public_listen(port + 1000, server))
         if env.Vars.PERSIST_PATH:
             state.save_state()
-            persist_task = asyncio.create_task(persist_regularly(state))
+            persist_task = asyncio.create_task(states.persist_regularly(state))
 
         print(f"Server listening on port {port}")
         await asyncio.Event().wait()

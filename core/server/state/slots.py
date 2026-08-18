@@ -1,11 +1,30 @@
-import fcntl
 from io import TextIOWrapper
 import os
 from typing import NamedTuple, Optional, Tuple
 
+try:
+    import fcntl  # Unix-only
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+    import msvcrt
+
 class SlotResult(NamedTuple):
     path: str
     file: TextIOWrapper
+
+
+def _try_lock(lock_file):
+    if fcntl is not None:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+
+    # Windows file locking requires locking an existing byte range.
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
 
 def try_aquire_slot(path: str) -> Optional[SlotResult]:
     """
@@ -19,9 +38,9 @@ def try_aquire_slot(path: str) -> Optional[SlotResult]:
     lock_file = os.fdopen(fd, "r+b")
 
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _try_lock(lock_file)
         return SlotResult(path=slot_path, file=lock_file)
-    except BlockingIOError:
+    except (BlockingIOError, OSError):
         lock_file.close()
         return None
 
@@ -31,6 +50,7 @@ def try_aquire_any_slot_or_create(path: str = "./persist/") -> Tuple[bool, SlotR
     Se não encontrar nenhum slot disponível, cria um novo.
     Retorna uma tupla com o caminho do slot e o arquivo de lock, ou None se não conseguiu.
     """
+    os.makedirs(path, exist_ok=True)
     slots = os.listdir(path)
     for slot in slots:
         slot_path = os.path.join(path, slot)

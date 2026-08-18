@@ -1,3 +1,5 @@
+import time
+
 from aiohttp import web
 from kademlia.network import Server
 
@@ -108,7 +110,12 @@ class NodeHTTPListener:
             key = bytes.fromhex(key_hex)
             
             # Store in DHT
-            await self.server.set(key, value)
+            stored = await self.server.set(key, value)
+            if not stored:
+                return web.json_response(
+                    {'error': 'Key was not stored in the DHT', 'key': key_hex},
+                    status=502,
+                )
             
             return web.json_response({'status': 'ok', 'key': key_hex})
         except ValueError as e:
