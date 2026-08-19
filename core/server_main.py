@@ -83,3 +83,7 @@ async def try_bootstrap(server: Server) -> bool:
         f"{len(neighbors)} neighbors"
     )
     return True
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

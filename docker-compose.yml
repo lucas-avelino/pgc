@@ -1,0 +1,41 @@
+services:
+  bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "core.server_main"]
+    network_mode: host
+    environment:
+      - LISTEN_PORT=4000
+      - METRICS_REPORT_INTERVAL=15
+      - REPLICATION_FACTOR=2
+      - PERSIST_PATH=/app/persist
+    volumes:
+      - .:/app
+      - ./persist:/app/persist
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "core.server_main"]
+    network_mode: host
+    environment:
+      LISTEN_PORT: 4001
+      BOOTSTRAP_ADDR: localhost:4000
+      METRICS_REPORT_INTERVAL: -1
+      REPLICATION_FACTOR: 2
+      PERSIST_PATH: /app/persist/
+      AUTOCALC_PORT: true
+      PERSIST_SAVE_INTERVAL: 60
+    volumes:
+      - .:/app
+      - ./persist/:/app/persist/
+    depends_on:
+      - bootstrap
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+

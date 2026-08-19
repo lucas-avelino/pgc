@@ -1,15 +1,15 @@
 
 import asyncio
 from datetime import datetime
-import json
-import re
+from typing import List
 
-from core.utils.consumer import Client
-from core.utils.embedding_reader import embedding_file_to_keys
-from core.utils.utils import write_file, write_json
-from core.utils.fill import retry_failed_requests, store_chunks
+from core.client.consumer import Client
+from core.client.embedding_reader import embedding_file_to_keys
+from core.client.utils import write_file, write_json
+from core.client.fill import retry_failed_requests, store_chunks
+from core.shared import env
 
-async def get_near(client: Client, command: [str]):
+async def get_near(client: Client, command: List[str]):
   start_time = datetime.now()
   keys = embedding_file_to_keys(command[1], int(command[2]))
   read_file_time = datetime.now()
@@ -57,7 +57,7 @@ async def get_near(client: Client, command: [str]):
   print(f"Time taken to process requests: {request_time - read_file_time}")
 
 async def main():
-  urls = [f"http://localhost:{i}" for i in range(5000, 5127)]
+  urls = [f"http://localhost:{i}" for i in range(5000, 5000 + env.Vars.SERVER_COUNT)]
   client = Client(urls=urls)
 
   command = input("> ").split(" ")
@@ -89,6 +89,7 @@ async def main():
 
       case "get_near_files":  # nome do arquivo, tamanho do embedding em bits, raio
         await get_near(client, command)
+
       case "retry_failed" | "retry_failed_requests":
         report_path = command[1] if len(command) > 1 else "fill_failed_requests.json"
         output_report_path = command[2] if len(command) > 2 else None
