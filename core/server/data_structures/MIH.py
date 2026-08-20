@@ -9,6 +9,23 @@ from core.shared import env
 
 KEY_SIZE = env.Vars.KEY_SIZE
 
+def round_robin_buckets(bucket_sizes):
+    offsets, total = [], 0
+    for size in bucket_sizes:
+        offsets.append(total)
+        total += size
+
+    perm = [0] * total
+    used = [0] * len(bucket_sizes)
+    value = 0
+    while value < total:
+        for i, size in enumerate(bucket_sizes):
+            if used[i] < size:
+                perm[offsets[i] + used[i]] = value
+                used[i] += 1
+                value += 1
+    return perm
+
 class MIH_Storage(IStorage):
     def __init__(self, ttl=604800, m=4):
         self.data = OrderedDict()
@@ -23,24 +40,17 @@ class MIH_Storage(IStorage):
         for size in self._piece_sizes:
             self._piece_offsets.append(acc)
             acc += size 
+        self._permut = round_robin_buckets(self._piece_sizes)
+        
 
-    def shuffle_bits(self, key: bytes):
-        total_bits = len(key) * 8
-        bits = [0] * total_bits
-        read = 0
-        for byte in key:
-            for i in range(7, -1, -1):
-                bucket = read % self.m
-                current = read // self.m
-                pos = self._piece_offsets[bucket] + current
-                bits[pos] = (byte >> i) & 1
-                read += 1
+    def shuffle_bits(self, key: bytes) -> bytes:
+        perm = self._permut
+        result = bytearray((len(perm) + 7) // 8)
+        for out_pos, in_pos in enumerate(perm):
+            if key[in_pos >> 3] & (1 << (7 - (in_pos & 7))):
+                result[out_pos >> 3] |= 1 << (7 - (out_pos & 7))
+        return bytes(result)
 
-        out = bytearray(len(key))
-        for idx, bit in enumerate(bits):
-            if bit:
-                out[idx // 8] |= 1 << (7 - idx % 8)
-        return bytes(out)
 
 
     def _split(self, key: bytes):
