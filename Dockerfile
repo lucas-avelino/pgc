@@ -1,4 +1,4 @@
-FROM pypy:3.10-slim
+FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -13,7 +13,7 @@ RUN apt-get update \
 COPY server-requirements.txt ./
 COPY kademlia-lib/ ./kademlia-lib/
 COPY core/ ./core/
-RUN pypy3 -m pip install --upgrade pip \
-    && pypy3 -m pip install -r server-requirements.txt
+RUN python3 -m pip install --upgrade pip \
+    && python3 -m pip install -r server-requirements.txt
 
-CMD ["pypy3", "-m", "core.server_main"]
+CMD ["python3", "-m", "core.server_main"]

@@ -1,26 +1,30 @@
+x-custom-server-count: &custom-server-count 127
+
 services:
   bootstrap:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["pypy3", "-m", "core.server_main"]
+    command: ["python3", "-m", "core.server_main"]
     network_mode: host
     environment:
-      - LISTEN_PORT=4000
-      - METRICS_REPORT_INTERVAL=15
-      - REPLICATION_FACTOR=2
-      - PERSIST_PATH=/app/persist
+      LISTEN_PORT: 4000
+      METRICS_REPORT_INTERVAL: 15
+      REPLICATION_FACTOR: 2
+      PERSIST_PATH: /app/persist
+      SERVER_COUNT: *custom-server-count
     volumes:
       - .:/app
       - ./persist:/app/persist
-    restart: unless-stopped
 
   server:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["pypy3", "-m", "core.server_main"]
+    command: ["python3", "-m", "core.server_main"]
     network_mode: host
+    depends_on:
+      - bootstrap
     environment:
       LISTEN_PORT: 4001
       BOOTSTRAP_ADDR: localhost:4000
@@ -29,13 +33,11 @@ services:
       PERSIST_PATH: /app/persist/
       AUTOCALC_PORT: true
       PERSIST_SAVE_INTERVAL: 60
+      SERVER_COUNT: *custom-server-count
     volumes:
       - .:/app
       - ./persist/:/app/persist/
-    depends_on:
-      - bootstrap
-    restart: unless-stopped
     deploy:
-      replicas: 2
+      replicas: *custom-server-count
 
 

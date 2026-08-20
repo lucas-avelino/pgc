@@ -37,7 +37,7 @@ class State:
         if is_new:
             print("No available slot for state persistence. Starting with a new state.")
             node_id = random.getrandbits(key_size_bits).to_bytes(key_size_bits // 8, "big")
-            storage = MIH_Storage(m=key_size_bits // 2) # para garantir o maximo de 50% de similaridade
+            storage = MIH_Storage(m=env.Vars.MIH_PARTITION_SIZE)
 
         print(f"Using slot {slot_info.path} for state persistence.")
         self.node_id = node_id

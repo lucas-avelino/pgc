@@ -1,7 +1,6 @@
 import os
 import socket
 
-
 class ConfigNames:
   BOOTSTRAP_ADDR = 'BOOTSTRAP_ADDR'
   LISTEN_PORT = 'LISTEN_PORT'
@@ -14,6 +13,8 @@ class ConfigNames:
   PERSIST_SAVE_INTERVAL = 'PERSIST_SAVE_INTERVAL'
   BOOTSTRAP_HEAL_INTERVAL = 'BOOTSTRAP_HEAL_INTERVAL'
   KEY_SIZE = 'KEY_SIZE'
+  MIH_PARTITION_SIZE = 'MIH_PARTITION_SIZE'
+  SERVER_COUNT = 'SERVER_COUNT'
 
 def _get_bool(name: str, default: bool = False) -> bool:
   value = os.getenv(name)
@@ -45,4 +46,6 @@ class Vars:
   PERSIST_SAVE_INTERVAL: int = int(os.getenv(ConfigNames.PERSIST_SAVE_INTERVAL) or '5')
   BOOTSTRAP_HEAL_INTERVAL: int = int(os.getenv(ConfigNames.BOOTSTRAP_HEAL_INTERVAL) or '10')
   KEY_SIZE: int = 64
-  SERVER_COUNT = 3
+  MIH_PARTITION_SIZE: int = 13
+  SERVER_COUNT= int(os.getenv(ConfigNames.SERVER_COUNT) or '1')
+

@@ -58,6 +58,7 @@ async def get_near(client: Client, command: List[str]):
 
 async def main():
   urls = [f"http://localhost:{i}" for i in range(5000, 5000 + env.Vars.SERVER_COUNT)]
+  print(f"Known server count: {len(urls)}")
   client = Client(urls=urls)
 
   command = input("> ").split(" ")
