@@ -2,9 +2,12 @@
 - core
   - server `onde fica maior parte do código relacionado ao servidor`
   - shared `código compartilhado entre client e nós da rede`
-  - utils  ``
-- kademlia-lib `clone do repo bmuller/kademlia com as modificaçõees necessarias no projeto`
-
+  - client `código do cli`
+- kademlia-lib        `clone do repo bmuller/kademlia com as modificaçõees necessarias no projeto`
+- embedder            `script que gera o embedding das imagens do projeto`
+- persist             `contem pastas com a persistência dos nós, serve para hot start da rede, sem precisar fazer fill da rede`
+- Dockerfile          `arquivo de build do container docker`
+- docker-compose.yml  `arquivo de configuração do docker compose`
 
 
 # HOW TOs

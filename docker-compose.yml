@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "core.server_main"]
+    command: ["pypy3", "-m", "core.server_main"]
     network_mode: host
     environment:
       - LISTEN_PORT=4000
@@ -19,7 +19,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "core.server_main"]
+    command: ["pypy3", "-m", "core.server_main"]
     network_mode: host
     environment:
       LISTEN_PORT: 4001
