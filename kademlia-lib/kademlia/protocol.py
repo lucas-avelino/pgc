@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import time
@@ -62,7 +63,7 @@ class KademliaProtocol(RPCProtocol):
             return self.rpc_find_node(sender, nodeid, key)
         return {"value": value}
     
-    def rpc_find_value_hamming(self, sender, nodeid, key, r, trace=False):
+    async def rpc_find_value_hamming(self, sender, nodeid, key, r, trace=False):
         source = Node(nodeid, sender[0], sender[1])
         self.welcome_if_new(source)
         timer = TraceTimer(enabled=trace, node_id=self.source_node.id)
@@ -76,19 +77,28 @@ class KademliaProtocol(RPCProtocol):
                     "storage_support": False,
                 }
             return response
-        results = self.storage.get_by_hamming(
-            key, r, trace=timer if trace else None, trace_prefix="remote_mih"
-        )
-        elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
-        response = {"results": [(k.hex(), v, d) for k, v, d in results]}
-        if trace:
-            response["trace"] = timer.finish(
-                storage_support=True,
-                results=len(results),
+
+        loop = asyncio.get_running_loop()
+        async with self.hamming_remote_sem:
+            results = await loop.run_in_executor(
+                self.hamming_remote_executor,
+                self.storage.get_by_hamming,
+                key,
+                r,
+                timer if trace else None,
+                "remote_mih",
             )
-            response["trace"]["total_ms"] = elapsed_ms
-        if not results:
-            return response
+
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+            response = {"results": [(k.hex(), v, d) for k, v, d in results]}
+            if trace:
+                response["trace"] = timer.finish(
+                    storage_support=True,
+                    results=len(results),
+                )
+                
+                response["trace"]["total_ms"] = elapsed_ms
+
         return response
 
     async def call_find_node(self, node_to_ask, node_to_find):

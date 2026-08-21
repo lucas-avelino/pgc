@@ -91,6 +91,8 @@ class Server:
     def _create_protocol(self):
         protocol = self.protocol_class(self.node, self.storage, self.ksize)
         protocol.replication_factor = self.replication_factor
+        protocol.hamming_remote_executor = self._hamming_executor
+        protocol.hamming_remote_sem = self._hamming_sem
         return protocol
 
     async def listen(self, port, interface="0.0.0.0"):
