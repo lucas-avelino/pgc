@@ -1,7 +1,9 @@
 
 import asyncio
-from datetime import datetime
-from typing import List
+import os
+import random
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
 
 from core.client.consumer import Client
 from core.client.embedding_reader import embedding_file_to_keys
@@ -9,7 +11,7 @@ from core.client.utils import write_file, write_json
 from core.client.fill import retry_failed_requests, store_chunks
 from core.shared import env
 
-async def get_near(client: Client, command: List[str]):
+async def get_near(client: Client, command: List[str]) -> Tuple[Dict[str, any], Dict[str, timedelta]]:
   start_time = datetime.now()
   keys = embedding_file_to_keys(command[1], int(command[2]))
   read_file_time = datetime.now()
@@ -51,10 +53,17 @@ async def get_near(client: Client, command: List[str]):
   grouped.sort(key=lambda x: x["total_distance"])
 
   write_json("grouped_responses.json", grouped)
-
   print(f"Responses written to responses.json")
   print(f"Time taken to read file: {read_file_time - start_time}")
   print(f"Time taken to process requests: {request_time - read_file_time}")
+  return grouped, {
+    "read_file_time": read_file_time - start_time,
+    "request_time": request_time - read_file_time,
+  }
+
+def get_random_embedding_file_path(path: str = "", amount: int = 1) -> List[str]:
+  files = [f for f in os.listdir(path) if f.endswith(".bin")]
+  return [os.path.join(path, random.choice(files)) for _ in range(amount)]
 
 async def main():
   urls = [f"http://localhost:{i}" for i in range(5000, 5000 + env.Vars.SERVER_COUNT)]
@@ -97,6 +106,29 @@ async def main():
         result = retry_failed_requests(report_path, output_report_path=output_report_path)
         print(f"Retry summary: {result['submitted']} submitted, {result['successful']} successful, {result['failed']} failed")
         print(f"Retry failures report: {result['report_path']}")
+
+      case "performance":
+        embedding_folder_path = command[1]
+        amount_of_searches = int(command[2])
+        parallelism = int(command[3]) if len(command) > 3 else 1
+        results = []
+
+        embedding_file_path = get_random_embedding_file_path(embedding_folder_path, amount_of_searches)
+        for i in range(0, amount_of_searches, parallelism):
+          print(f"[{i/parallelism}/ {amount_of_searches/parallelism}] Searching for near keys for embedding files: {embedding_file_path[i:i+parallelism]}")
+          tasks = [get_near(client, ["get_near_files", k, "64", "12"]) for k in embedding_file_path[i:i+parallelism]]
+          r = await asyncio.gather(*tasks)
+          results.extend([res[1] for res in r])
+
+
+        write_json("performance_results.json", {
+          "avg_request_time": sum([r["request_time"].total_seconds() for r in results]) / len(results),
+          "max_request_time": max([r["request_time"].total_seconds() for r in results]),
+          "min_request_time": min([r["request_time"].total_seconds() for r in results]),
+          "p99_request_time": sorted([r["request_time"].total_seconds() for r in results])[int(len(results) * 0.9)],
+          "p90_request_time": sorted([r["request_time"].total_seconds() for r in results])[int(len(results) * 0.9)],
+        })
+        
       case _:
         print(f"Unknown command: {command[0]}")
 
