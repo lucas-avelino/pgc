@@ -1,5 +1,6 @@
 
 import asyncio
+import json
 import os
 import random
 from datetime import datetime, timedelta
@@ -11,7 +12,7 @@ from core.client.utils import write_file, write_json
 from core.client.fill import retry_failed_requests, store_chunks
 from core.shared import env
 
-async def get_near(client: Client, command: List[str]) -> Tuple[Dict[str, any], Dict[str, timedelta]]:
+async def get_near(client: Client, command: List[str], write_output: bool = True) -> Tuple[Dict[str, any], Dict[str, timedelta]]:
   start_time = datetime.now()
   keys = embedding_file_to_keys(command[1], int(command[2]))
   read_file_time = datetime.now()
@@ -19,7 +20,8 @@ async def get_near(client: Client, command: List[str]) -> Tuple[Dict[str, any], 
   tasks = [client.get_near(k, int(command[3])) for k in keys]
   responses = await asyncio.gather(*tasks)
   request_time = datetime.now()
-  write_json("responses.json", responses)
+  if write_output:
+    write_json("responses.json", responses)
   
   grouped = {}
   for response in responses:
@@ -52,18 +54,121 @@ async def get_near(client: Client, command: List[str]) -> Tuple[Dict[str, any], 
   grouped = [{"value": key, **grouped[key]} for key in grouped]
   grouped.sort(key=lambda x: x["total_distance"])
 
-  write_json("grouped_responses.json", grouped)
-  print(f"Responses written to responses.json")
-  print(f"Time taken to read file: {read_file_time - start_time}")
-  print(f"Time taken to process requests: {request_time - read_file_time}")
+  if write_output:
+    write_json("grouped_responses.json", grouped)
+    print(f"Responses written to responses.json")
+    print(f"Time taken to read file: {read_file_time - start_time}")
+    print(f"Time taken to process requests: {request_time - read_file_time}")
   return grouped, {
     "read_file_time": read_file_time - start_time,
     "request_time": request_time - read_file_time,
   }
 
-def get_random_embedding_file_path(path: str = "", amount: int = 1) -> List[str]:
-  files = [f for f in os.listdir(path) if f.endswith(".bin")]
-  return [os.path.join(path, random.choice(files)) for _ in range(amount)]
+DEFAULT_SEED = 42
+
+def get_random_embedding_file_path(path: str = "", amount: int = 1, seed: int = DEFAULT_SEED) -> List[str]:
+  # a lista precisa estar ordenada: os.listdir nao garante ordem estavel,
+  # e sem isso a mesma seed sortearia imagens diferentes em cada maquina
+  files = sorted(f for f in os.listdir(path) if f.endswith(".bin"))
+  rng = random.Random(seed)
+  return [os.path.join(path, rng.choice(files)) for _ in range(amount)]
+
+RECALL_KS = [1, 10, 50, 100, 500]
+
+def percentile(values: List[float], q: float) -> float:
+  ordered = sorted(values)
+  return ordered[min(int(len(ordered) * q), len(ordered) - 1)]
+
+def load_top500(ground_truth_path: str, embedding_file: str) -> List[str] | None:
+  path = os.path.join(ground_truth_path, f"{os.path.basename(embedding_file)}.json")
+  if not os.path.isfile(path):
+    return None
+  with open(path, "r", encoding="utf-8") as f:
+    return json.load(f)["neighbors"]
+
+async def recall(client: Client, command: List[str]) -> Dict[str, any]:
+  base_path = command[1]
+  amount = int(command[2])
+  radius = command[3] if len(command) > 3 else "12"
+  ground_truth_path = command[4] if len(command) > 4 else "./data/top500"
+  seed = int(command[5]) if len(command) > 5 else DEFAULT_SEED
+
+  files = get_random_embedding_file_path(base_path, amount, seed)
+  results = []
+
+  for i, file in enumerate(files):
+    truth = load_top500(ground_truth_path, file)
+    if truth is None:
+      print(f"[{i + 1}/{len(files)}] {os.path.basename(file)}: sem ground truth em {ground_truth_path}, pulando")
+      continue
+
+    grouped, times = await get_near(client, ["get_near_files", file, "64", radius], write_output=False)
+    # a propria imagem consultada nao esta no ground truth, entao sai da comparacao
+    found = [entry["value"] for entry in grouped if entry["value"] != os.path.basename(file)]
+
+    # quantas das 500 imagens verdadeiras a rede devolveu, em qualquer posicao
+    top500_found = len(set(found) & set(truth))
+
+    result = {
+      "file": os.path.basename(file),
+      "returned": len(found),
+      "top500_found": top500_found,
+      "coverage": top500_found / len(truth),  # o mesmo numero, normalizado
+      "request_time": times["request_time"].total_seconds(),
+    }
+    for k in RECALL_KS:
+      result[f"recall@{k}"] = len(set(found[:k]) & set(truth[:k])) / k
+    results.append(result)
+
+    print(
+      f"[{i + 1}/{len(files)}] {result['file']}: "
+      f"top500 {result['top500_found']}/{len(truth)} "
+      f"recall@10 {result['recall@10']:.2f} "
+      f"recall@500 {result['recall@500']:.2f} "
+      f"({result['returned']} resultados em {result['request_time']:.2f}s)"
+    )
+
+  if not results:
+    print(f"Nenhuma imagem sorteada tem ground truth em {ground_truth_path}")
+    return {}
+
+  def stats(field: str) -> Dict[str, float]:
+    values = [r[field] for r in results]
+    return {
+      "avg": sum(values) / len(values),
+      "p50": percentile(values, 0.50),
+      "p90": percentile(values, 0.90),
+      "min": min(values),
+      "max": max(values),
+    }
+
+  fields = ["top500_found"] + [f"recall@{k}" for k in RECALL_KS] + ["returned", "request_time"]
+  summary = {
+    "params": {
+      "base_path": base_path,
+      "amount": len(results),
+      "r": int(radius),
+      "ground_truth_path": ground_truth_path,
+      "seed": seed,
+    },
+    "coverage": sum(r["coverage"] for r in results) / len(results),  # top500_found normalizado
+    **{field: stats(field) for field in fields},
+  }
+
+  report_path = f"recall_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+  write_json(report_path, {**summary, "results": results})
+
+  print()
+  print(f"{'':<14}{'avg':>9}{'p50':>9}{'p90':>9}{'min':>9}{'max':>9}")
+  for field in fields:
+    s = summary[field]
+    print(
+      f"{field:<14}{s['avg']:>9.3f}{s['p50']:>9.3f}{s['p90']:>9.3f}"
+      f"{s['min']:>9.3f}{s['max']:>9.3f}"
+    )
+  print(f"\ncobertura media do top-500: {summary['coverage']:.4f}")
+  print(f"Relatorio escrito em {report_path}")
+  return summary
 
 async def main():
   urls = [f"http://localhost:{i}" for i in range(5000, 5000 + env.Vars.SERVER_COUNT)]
@@ -100,6 +205,9 @@ async def main():
       case "get_near_files":  # nome do arquivo, tamanho do embedding em bits, raio
         await get_near(client, command)
 
+      case "recall":  # pasta dos embeddings, qtd de imagens, [raio], [pasta do ground truth]
+        await recall(client, command)
+
       case "retry_failed" | "retry_failed_requests":
         report_path = command[1] if len(command) > 1 else "fill_failed_requests.json"
         output_report_path = command[2] if len(command) > 2 else None
@@ -111,9 +219,10 @@ async def main():
         embedding_folder_path = command[1]
         amount_of_searches = int(command[2])
         parallelism = int(command[3]) if len(command) > 3 else 1
+        seed = int(command[4]) if len(command) > 4 else DEFAULT_SEED
         results = []
 
-        embedding_file_path = get_random_embedding_file_path(embedding_folder_path, amount_of_searches)
+        embedding_file_path = get_random_embedding_file_path(embedding_folder_path, amount_of_searches, seed)
         for i in range(0, amount_of_searches, parallelism):
           print(f"[{i/parallelism}/ {amount_of_searches/parallelism}] Searching for near keys for embedding files: {embedding_file_path[i:i+parallelism]}")
           tasks = [get_near(client, ["get_near_files", k, "64", "12"]) for k in embedding_file_path[i:i+parallelism]]
@@ -126,6 +235,7 @@ async def main():
             {
               "amount_of_searches": amount_of_searches,
               "parallelism": parallelism,
+              "seed": seed,
             },
           "qtd_results_total": sum([r[1] for r in results]),
           "avg_results_per_search": sum([r[1] for r in results]) / len(results),

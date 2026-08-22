@@ -5,6 +5,8 @@
   - client `código do cli`
 - kademlia-lib        `clone do repo bmuller/kademlia com as modificaçõees necessarias no projeto`
 - embedder            `script que gera o embedding das imagens do projeto`
+- tools               `scripts auxiliares de analise, fora do caminho da rede`
+- data/top500         `ground truth: os 500 vizinhos mais proximos de cada embedding, um json por imagem`
 - persist             `contem pastas com a persistência dos nós, serve para hot start da rede, sem precisar fazer fill da rede`
 - Dockerfile          `arquivo de build do container docker`
 - docker-compose.yml  `arquivo de configuração do docker compose`
@@ -27,5 +29,8 @@ retry_failed fill_failed_requests.json
 performance ../embeddings-1024/ 100 2
 
 performance ../embeddings-1024/ 5914 1
+
+recall ../embeddings-1024 100
+recall ../embeddings-1024 100 12 ./data/top500
 000000000009
 
