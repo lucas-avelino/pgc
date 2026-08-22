@@ -1,20 +1,3 @@
-"""Calcula os 500 vizinhos mais proximos de cada imagem pela distancia de
-Hamming do embedding binario de 1024 bits.
-
-Grava um JSON por embedding em ./data/top500/<nome>.bin.json:
-
-    {
-      "name": "000000000009.jpg.bin",
-      "k": 500,
-      "bits": 1024,
-      "neighbors": ["000000093683.jpg.bin", ...],   # ordenado por distancia
-      "distances": [212, ...]
-    }
-
-Uso:
-    python -m tools.top500 ../embeddings-1024 ./data/top500
-"""
-
 import json
 import os
 import sys
