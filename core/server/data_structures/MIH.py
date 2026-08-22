@@ -198,8 +198,7 @@ class MIH_Storage(IStorage):
 
     @staticmethod
     def _hamming(a: bytes, b: bytes) -> int:
-        assert len(a) == len(b), "keys must have the same size"
-        return sum((x ^ y).bit_count() for x, y in zip(a, b))
+        return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).bit_count()
 
     def __repr__(self):
         

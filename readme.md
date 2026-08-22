@@ -24,6 +24,8 @@ fill ../embeddings-1024/ 1892640
 
 retry_failed fill_failed_requests.json
 
+performance ../embeddings-1024/ 100 2
 
+performance ../embeddings-1024/ 5914 1
 000000000009
 

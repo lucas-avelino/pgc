@@ -118,15 +118,24 @@ async def main():
           print(f"[{i/parallelism}/ {amount_of_searches/parallelism}] Searching for near keys for embedding files: {embedding_file_path[i:i+parallelism]}")
           tasks = [get_near(client, ["get_near_files", k, "64", "12"]) for k in embedding_file_path[i:i+parallelism]]
           r = await asyncio.gather(*tasks)
-          results.extend([res[1] for res in r])
+          results.extend([(res[1], len(res[0])) for res in r])
 
 
-        write_json("performance_results.json", {
-          "avg_request_time": sum([r["request_time"].total_seconds() for r in results]) / len(results),
-          "max_request_time": max([r["request_time"].total_seconds() for r in results]),
-          "min_request_time": min([r["request_time"].total_seconds() for r in results]),
-          "p99_request_time": sorted([r["request_time"].total_seconds() for r in results])[int(len(results) * 0.9)],
-          "p90_request_time": sorted([r["request_time"].total_seconds() for r in results])[int(len(results) * 0.9)],
+        write_json(f"performance_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json", {
+          "params":
+            {
+              "amount_of_searches": amount_of_searches,
+              "parallelism": parallelism,
+            },
+          "qtd_results_total": sum([r[1] for r in results]),
+          "avg_results_per_search": sum([r[1] for r in results]) / len(results),
+          "max_results_per_search": max([r[1] for r in results]),
+          "min_results_per_search": min([r[1] for r in results]),
+          "avg_request_time": sum([r[0]["request_time"].total_seconds() for r in results]) / len(results),
+          "max_request_time": max([r[0]["request_time"].total_seconds() for r in results]),
+          "min_request_time": min([r[0]["request_time"].total_seconds() for r in results]),
+          "p99_request_time": sorted([r[0]["request_time"].total_seconds() for r in results])[int(len(results) * 0.9)],
+          "p90_request_time": sorted([r[0]["request_time"].total_seconds() for r in results])[int(len(results) * 0.9)],
         })
         
       case _:
