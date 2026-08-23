@@ -48,4 +48,7 @@ class Vars:
   KEY_SIZE: int = 64
   MIH_PARTITION_SIZE: int = 13
   SERVER_COUNT= int(os.getenv(ConfigNames.SERVER_COUNT) or '1')
+  RANDOM_SEED: int = 42
+  RESULT_FOLDER_PREFIX: str = './data/results/'
+
 
