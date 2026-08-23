@@ -1,0 +1,14 @@
+{
+  "model": "ViT-B-32",
+  "pretrained": "laion2b_s34b_b79k",
+  "input": "C:\\Users\\lucas\\projects\\pgc\\pgc-rust\\data\\train2017",
+  "output": "C:\\Users\\lucas\\projects\\pgc\\embeddings-1024",
+  "image_count": 118287,
+  "embedded_count": 118287,
+  "failed_count": 0,
+  "embedding_dim": 512,
+  "projection_bits": 1024,
+  "projection_seed": 42,
+  "normalize": false,
+  "device": "cuda"
+}
