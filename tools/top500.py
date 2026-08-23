@@ -75,7 +75,7 @@ def write_files(output_path: str, names, neighbors, distances):
 
 
 def main():
-    base_path = sys.argv[1] if len(sys.argv) > 1 else "../embeddings-1024"
+    base_path = sys.argv[1] if len(sys.argv) > 1 else "./data/embeddings-1024"
     output_path = sys.argv[2] if len(sys.argv) > 2 else "./data/top500"
 
     start = time.time()
