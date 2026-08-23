@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 
@@ -75,6 +76,43 @@ def get_random_embedding_file_path(path: str = "", amount: int = 1, seed: int = 
 
 RECALL_KS = [1, 10, 50, 100, 500]
 
+_embedding_cache: Dict[str, Dict[str, bytes]] = {}
+
+def load_embeddings(base_path: str) -> Dict[str, bytes]:
+  if base_path in _embedding_cache:
+    return _embedding_cache[base_path]
+
+  names = sorted(f for f in os.listdir(base_path) if f.endswith(".bin"))
+  embeddings: Dict[str, bytes] = {}
+
+  def read(name: str) -> None:
+    with open(os.path.join(base_path, name), "rb") as f:
+      embeddings[name] = f.read()
+
+  print(f"Carregando {len(names)} embeddings de {base_path} para ranquear por Hamming...")
+  start = datetime.now()
+  with ThreadPoolExecutor(max_workers=64) as executor:
+    list(executor.map(read, names, chunksize=256))
+  print(f"Embeddings carregados em {datetime.now() - start}")
+
+  _embedding_cache[base_path] = embeddings
+  return embeddings
+
+def hamming(a: bytes, b: bytes) -> int:
+  return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).bit_count()
+
+def rank_by_hamming(grouped: List[Dict[str, any]], query_file: str, base_path: str) -> List[Dict[str, any]]:
+  embeddings = load_embeddings(base_path)
+  query = embeddings[os.path.basename(query_file)]
+
+  ranked = [
+    {**entry, "hamming_distance": hamming(query, embeddings[entry["value"]])}
+    for entry in grouped
+    if entry["value"] in embeddings
+  ]
+  ranked.sort(key=lambda entry: entry["hamming_distance"])
+  return ranked
+
 def percentile(values: List[float], q: float) -> float:
   ordered = sorted(values)
   return ordered[min(int(len(ordered) * q), len(ordered) - 1)]
@@ -99,18 +137,22 @@ async def recall(client: Client, command: List[str]) -> Dict[str, any]:
   for i, file in enumerate(files):
     truth = load_top500(ground_truth_path, file)
     if truth is None:
-      print(f"[{i + 1}/{len(files)}] {os.path.basename(file)}: sem ground truth em {ground_truth_path}, pulando")
       continue
 
     grouped, times = await get_near(client, ["get_near_files", file, "64", radius], write_output=False)
+    reranked = rank_by_hamming(grouped, file, base_path)
+
     # a propria imagem consultada nao esta no ground truth, entao sai da comparacao
-    found = [entry["value"] for entry in grouped if entry["value"] != os.path.basename(file)]
+    query_name = os.path.basename(file)
+    found = [entry["value"] for entry in grouped if entry["value"] != query_name]
+    found_by_hamming = [entry["value"] for entry in reranked if entry["value"] != query_name]
 
     # quantas das 500 imagens verdadeiras a rede devolveu, em qualquer posicao
+    # (independe do ranking: os dois ordenam o mesmo conjunto de candidatos)
     top500_found = len(set(found) & set(truth))
 
     result = {
-      "file": os.path.basename(file),
+      "file": query_name,
       "returned": len(found),
       "top500_found": top500_found,
       "coverage": top500_found / len(truth),  # o mesmo numero, normalizado
@@ -118,15 +160,9 @@ async def recall(client: Client, command: List[str]) -> Dict[str, any]:
     }
     for k in RECALL_KS:
       result[f"recall@{k}"] = len(set(found[:k]) & set(truth[:k])) / k
+      result[f"hamming_recall@{k}"] = len(set(found_by_hamming[:k]) & set(truth[:k])) / k
     results.append(result)
-
-    print(
-      f"[{i + 1}/{len(files)}] {result['file']}: "
-      f"top500 {result['top500_found']}/{len(truth)} "
-      f"recall@10 {result['recall@10']:.2f} "
-      f"recall@500 {result['recall@500']:.2f} "
-      f"({result['returned']} resultados em {result['request_time']:.2f}s)"
-    )
+    print(f"[{i+1}/{len(files)}] {query_name}: {result['top500_found']}/{len(truth)} top500 found, {result['returned']} returned, request_time={result['request_time']:.3f}s")
 
   if not results:
     print(f"Nenhuma imagem sorteada tem ground truth em {ground_truth_path}")
@@ -134,15 +170,17 @@ async def recall(client: Client, command: List[str]) -> Dict[str, any]:
 
   def stats(field: str) -> Dict[str, float]:
     values = [r[field] for r in results]
+    avg = sum(values) / len(values)
     return {
-      "avg": sum(values) / len(values),
+      "avg": avg,
+      "std": (sum((value - avg) ** 2 for value in values) / len(values)) ** 0.5,
       "p50": percentile(values, 0.50),
       "p90": percentile(values, 0.90),
       "min": min(values),
       "max": max(values),
     }
 
-  fields = ["top500_found"] + [f"recall@{k}" for k in RECALL_KS] + ["returned", "request_time"]
+  fields = ( ["top500_found"] + [f"recall@{k}" for k in RECALL_KS] + [f"hamming_recall@{k}" for k in RECALL_KS] + ["returned", "request_time"])
   summary = {
     "params": {
       "base_path": base_path,
@@ -157,17 +195,6 @@ async def recall(client: Client, command: List[str]) -> Dict[str, any]:
 
   report_path = f"recall_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
   write_json(report_path, {**summary, "results": results})
-
-  print()
-  print(f"{'':<14}{'avg':>9}{'p50':>9}{'p90':>9}{'min':>9}{'max':>9}")
-  for field in fields:
-    s = summary[field]
-    print(
-      f"{field:<14}{s['avg']:>9.3f}{s['p50']:>9.3f}{s['p90']:>9.3f}"
-      f"{s['min']:>9.3f}{s['max']:>9.3f}"
-    )
-  print(f"\ncobertura media do top-500: {summary['coverage']:.4f}")
-  print(f"Relatorio escrito em {report_path}")
   return summary
 
 async def main():
