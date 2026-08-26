@@ -109,7 +109,7 @@ async def main():
         await get_near(client, command)
 
       case "recall_rand":  # pasta dos embeddings, qtd de imagens, [raio], [pasta do ground truth]
-        await recall_rand(client, ho_get_near(client))
+        await recall_rand(command, ho_get_near(client))
 
       case "recall": # embedding da imagem, [raio], [pasta do ground truth]
         await recall(command, ho_get_near(client))

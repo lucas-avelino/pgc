@@ -38,7 +38,7 @@ class Vars:
   BOOTSTRAP_ADDR: tuple[str, int] | None = _parse_addr(os.getenv(ConfigNames.BOOTSTRAP_ADDR))
   LISTEN_PORT: int = int(os.getenv(ConfigNames.LISTEN_PORT) or '4001' )
   AUTOCALC_PORT: bool = _get_bool(ConfigNames.AUTOCALC_PORT)
-  K_SIZE: int = int(os.getenv(ConfigNames.K_SIZE) or '20')
+  K_SIZE: int = int(os.getenv(ConfigNames.K_SIZE) or '10')
   METRICS_REPORT_INTERVAL: int = int(os.getenv(ConfigNames.METRICS_REPORT_INTERVAL) or '30')
   REPLICATION_FACTOR: int = int(os.getenv(ConfigNames.REPLICATION_FACTOR) or '3')
   ENABLE_HTTP: bool = _get_bool(ConfigNames.ENABLE_HTTP, default=True)

@@ -1,13 +1,19 @@
 import operator
 import time
 from itertools import takewhile
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 
 from kademlia.storage import IStorage
 
 from core.shared import env
 
 KEY_SIZE = env.Vars.KEY_SIZE
+
+def values_as_list(stored) -> list:
+    return stored if type(stored) is list else [stored]
+
+def compact_values(values):
+    return values[0] if len(values) == 1 else list(values)
 
 def round_robin_buckets(bucket_sizes):
     offsets, total = [], 0
@@ -28,7 +34,7 @@ def round_robin_buckets(bucket_sizes):
 
 class MIH_Storage(IStorage):
     def __init__(self, ttl=604800, m=4):
-        self.data = OrderedDict()
+        self.data = {}
         self.ttl = ttl
         self.m = m
         self.pieces = [defaultdict(set) for _ in range(m)]
@@ -79,13 +85,16 @@ class MIH_Storage(IStorage):
     def __setitem__(self, key, value):
         key = self.shuffle_bits(key)
         is_new = key not in self.data
-        if key in self.data:
-            _, values = self.data.pop(key)
-            if value not in values:
-                values.append(value)
+        if is_new:
+            stored = value
         else:
-            values = [value]
-        self.data[key] = (time.monotonic(), values)
+            _, stored = self.data.pop(key)
+            if type(stored) is list:
+                if value not in stored:
+                    stored.append(value)
+            elif stored != value:
+                stored = [stored, value]
+        self.data[key] = (time.monotonic(), stored)
         if is_new:
             self._index(key)
         
@@ -99,9 +108,9 @@ class MIH_Storage(IStorage):
                 {
                     "key": key,
                     "age": max(0, now - birthday),
-                    "values": values,
+                    "values": values_as_list(stored),
                 }
-                for key, (birthday, values) in self.data.items()
+                for key, (birthday, stored) in self.data.items()
             ],
         }
 
@@ -115,7 +124,7 @@ class MIH_Storage(IStorage):
             if not values:
                 continue
             birthday = now if reset_age else now - entry.get("age", 0)
-            storage.data[key] = (birthday, list(values))
+            storage.data[key] = (birthday, compact_values(values))
             storage._index(key)
         storage.cull()
         return storage
@@ -135,7 +144,7 @@ class MIH_Storage(IStorage):
 
     def __getitem__(self, key):
         
-        return self.data[key][1]
+        return values_as_list(self.data[key][1])
 
     def get_by_hamming(self, query: bytes, r: int, trace=None, trace_prefix="mih"):
         query = self.shuffle_bits(query)
@@ -177,7 +186,7 @@ class MIH_Storage(IStorage):
             if d <= r:
                 current = results.get(key)
                 if current is None or d < current[1]:
-                    results[key] = (entry[1], d)
+                    results[key] = (values_as_list(entry[1]), d)
         if trace is not None:
             trace.step(
                 f"{trace_prefix}.hamming_filter",
@@ -210,8 +219,8 @@ class MIH_Storage(IStorage):
         matches = takewhile(lambda r: min_birthday >= r[1], zipped)
         return [
             (key, value)
-            for key, _, values in matches
-            for value in values
+            for key, _, stored in matches
+            for value in values_as_list(stored)
         ]
 
     def _triple_iter(self):
@@ -224,6 +233,6 @@ class MIH_Storage(IStorage):
         
         return (
             (key, value)
-            for key, (_, values) in self.data.items()
-            for value in values
+            for key, (_, stored) in self.data.items()
+            for value in values_as_list(stored)
         )

@@ -88,7 +88,7 @@ async def recall_rand(command: List[str], get_near: callable) -> Dict[str, any]:
     # get_near ja devolve ordenado por Hamming; a ordem da rede e reconstruida
     # a partir de total_distance so para manter a comparacao entre os rankings
     grouped, times = await get_near(["get_near_files", file, "64", radius], write_output=False)
-    result, query_name, truth = measure_recall(grouped, times, ground_truth_path=ground_truth_path)
+    result, query_name, truth = measure_recall(file, grouped, times, ground_truth_path=ground_truth_path)
     results.append(result)
     print(f"[{i+1}/{len(files)}] {query_name}: {result['top500_found']}/{len(truth)} top500 found, {result['returned']} returned, request_time={result['request_time']:.3f}s")
 
