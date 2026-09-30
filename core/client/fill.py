@@ -25,6 +25,8 @@ def count_chunks(base_path: str, hash_size_bits: int, hard_limit: int) -> int:
     chunk_size = hash_size_bits // 8
     total = 0
     for file in os.listdir(base_path):
+        if not file.endswith(".bin"):
+            continue
         path = os.path.join(base_path, file)
         if not os.path.isfile(path):
             continue
@@ -224,9 +226,12 @@ def retry_failed_requests(
 
 
 def chunk_generator(base_path: str, hash_size_bits: int):
-    # pega todos os files de base_path, divide em pedaços de hash_size_bits bits
+    # pega os .bin de base_path, divide em pedaços de hash_size_bits bits
+    # (a pasta tem index.jsonl e manifest.json junto, que não são embeddings)
     chunk_size = hash_size_bits // 8
     for file in os.listdir(base_path):
+        if not file.endswith(".bin"):
+            continue
         path = os.path.join(base_path, file)
         if not os.path.isfile(path):
             continue

@@ -37,7 +37,7 @@ class MIH_Storage(IStorage):
         self.data = {}
         self.ttl = ttl
         self.m = m
-        self.pieces = [defaultdict(set) for _ in range(m)]
+        self.pieces = [defaultdict(list) for _ in range(m)]
 
         base, rem = divmod(KEY_SIZE, m)
         self._piece_sizes = [base + 1 if i < rem else base for i in range(m)]
@@ -72,13 +72,16 @@ class MIH_Storage(IStorage):
 
     def _index(self, key: bytes):
         for i, piece in enumerate(self._split(key)):
-            self.pieces[i][piece].add(key)
+            self.pieces[i][piece].append(key)
 
     def _deindex(self, key: bytes):
         for i, piece in enumerate(self._split(key)):
             bucket = self.pieces[i].get(piece)
             if bucket is not None:
-                bucket.discard(key)
+                try:
+                    bucket.remove(key)
+                except ValueError:
+                    continue
                 if not bucket:
                     del self.pieces[i][piece]
 
@@ -163,7 +166,7 @@ class MIH_Storage(IStorage):
         else:
             candidates = set()
             for i, piece in enumerate(self._split(query)):
-                candidates |= self.pieces[i].get(piece, set())
+                candidates.update(self.pieces[i].get(piece, ()))
             candidate_source = "mih_buckets"
         if trace is not None:
             trace.step(

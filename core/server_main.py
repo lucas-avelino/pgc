@@ -24,7 +24,9 @@ async def main():
         key_size_bits=KEY_SIZE_BITS
     )
 
-    port = await listen(server)
+    port = await listen(server, state)
+    state.port = port
+    state.save_node_file()
 
     metric_task = None
     http_task = None
@@ -60,8 +62,9 @@ async def main():
             state.save_state()
         server.stop()
 
-async def listen(server: Server) -> int:
-    port = env.Vars.LISTEN_PORT
+async def listen(server: Server, state: states.State) -> int:
+    # a porta salva no node.txt do slot ganha, para o nó voltar sempre na mesma
+    port = state.port or env.Vars.LISTEN_PORT
     while True:
         try:
             await server.listen(port)
