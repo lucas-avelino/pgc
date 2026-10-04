@@ -1,0 +1,57 @@
+x-nodes-per-proc: &nodes-per-proc "8"
+x-replicas: &replicas 16
+x-server-count: &server-count 129
+
+
+x-multi-node-cmd: &multi-node-cmd
+  - python3
+  - -c
+  - |
+    import asyncio, os
+    import core.server_main as m
+    n = int(os.environ["NODES_PER_PROC"])
+    async def go():
+        await asyncio.gather(*[m.main() for _ in range(n)])
+    asyncio.run(go())
+
+services:
+  bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python3", "-m", "core.server_main"]
+    network_mode: host
+    environment:
+      LISTEN_PORT: 4000
+      METRICS_REPORT_INTERVAL: 15
+      REPLICATION_FACTOR: 2
+      PERSIST_PATH: /app/persist
+      SERVER_COUNT: *server-count
+    volumes:
+      - .:/app
+      - ./persist:/app/persist
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: *multi-node-cmd
+    network_mode: host
+    depends_on:
+      - bootstrap
+    environment:
+      NODES_PER_PROC: *nodes-per-proc
+      PYTHONPATH: /app:/app/core
+      LISTEN_PORT: 4001
+      BOOTSTRAP_ADDR: localhost:4000
+      METRICS_REPORT_INTERVAL: -1
+      REPLICATION_FACTOR: 2
+      PERSIST_PATH: /app/persist/
+      AUTOCALC_PORT: true
+      PERSIST_SAVE_INTERVAL: 60
+      SERVER_COUNT: *server-count
+    volumes:
+      - .:/app
+      - ./persist/:/app/persist/
+    deploy:
+      replicas: *replicas
