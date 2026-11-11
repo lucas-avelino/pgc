@@ -55,6 +55,11 @@ de cada no em +1000. Os node ids continuam os mesmos, so as portas andam:
 
     python tools/bench_matrix.py --base-port 14000
 
+Mais PUTs simultaneos no fill (padrao 64; a vazao do fill depende disso, entao
+so compare grupos rodados com o mesmo valor):
+
+    python tools/bench_matrix.py --fill-workers 256
+
 Rodada rapida de validacao (2 grupos, 2000 imagens no fill, 50 buscas):
 
     python tools/bench_matrix.py --only emb1024_rf2_k10_n64,emb1024_rf1_k10_n64 \
@@ -180,6 +185,8 @@ LEGACY_SERVER_NODES = 128
 # e esta quantidade de nos por container (resultados sem o campo valem como 8)
 LEGACY_NODES_PER_CONTAINER = 8
 DEFAULT_NODES_PER_CONTAINER = 1
+# PUTs simultaneos no fill (o padrao do store_chunks, usado em todas as rodadas antigas)
+DEFAULT_FILL_WORKERS = 64
 
 OVERRIDE_TEMPLATE = """# gerado por tools/bench_matrix.py -- grupo {label}
 # {group}
@@ -725,13 +732,16 @@ def build_query_sample(configs: Sequence[Config], amount: int, seed: int, cache_
 # ---------------------------------------------------------------------- medicoes
 
 
-async def run_fill(config: Config, urls: List[str], out_dir: Path, hard_limit: int) -> Dict[str, Any]:
-    log(f"fill de {config.embeddings_dir} (limite de {hard_limit} chunks)")
+async def run_fill(
+    config: Config, urls: List[str], out_dir: Path, hard_limit: int, workers: int = DEFAULT_FILL_WORKERS
+) -> Dict[str, Any]:
+    log(f"fill de {config.embeddings_dir} (limite de {hard_limit} chunks, {workers} requisicoes simultaneas)")
     started = time.time()
     submitted, elapsed = await store_chunks(
         str(config.embeddings_dir),
         urls,
         hard_limit=hard_limit,
+        max_workers=workers,
         hash_size_bits=KEY_SIZE_BITS,
         failure_report_path=str(out_dir / "fill_failed_requests.json"),
     )
@@ -741,6 +751,7 @@ async def run_fill(config: Config, urls: List[str], out_dir: Path, hard_limit: i
         "base_path": display_path(config.embeddings_dir),
         "hash_size_bits": KEY_SIZE_BITS,
         "hard_limit": hard_limit,
+        "workers": workers,
         "chunks_submitted": submitted,
         "chunks_failed": failures,
         "chunks_ok": submitted - failures,
@@ -1005,7 +1016,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         hard_limit = options.fill_limit or (
             options.fill_images * config.chunks_per_image if options.fill_images else 10 ** 9
         )
-        fill = await run_fill(config, urls, out_dir, hard_limit)
+        fill = await run_fill(config, urls, out_dir, hard_limit, options.fill_workers)
 
         client = Client(urls=urls)
         try:
@@ -1121,6 +1132,7 @@ def write_matrix_summary(summaries: Sequence[Dict[str, Any]], results_dir: Path)
             "fill_falhas": fill["chunks_failed"],
             "fill_tempo": fill["elapsed_human"],
             "fill_chunks_s": fill["chunks_per_second"],
+            "fill_workers": fill.get("workers", DEFAULT_FILL_WORKERS),
             "buscas": sequential["queries_ok"],
             "resultados_por_busca": round(sequential["avg_results_per_query"], 2),
             "hamming_coverage": round(hamming["coverage"], 4),
@@ -1169,6 +1181,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="preenche so as N primeiras imagens da pasta (padrao: dataset inteiro)")
     parser.add_argument("--fill-limit", type=int, default=None,
                         help="limite bruto de chunks no fill; tem prioridade sobre --fill-images")
+    parser.add_argument("--fill-workers", type=int, default=DEFAULT_FILL_WORKERS,
+                        help="PUTs simultaneos no fill; a vazao do fill depende dele, entao compare "
+                             "grupos rodados com o mesmo valor")
     parser.add_argument("--nodes", default=",".join(str(nodes) for nodes in NODE_COUNTS),
                         help=f"quantidades de nos de server da matriz, separadas por virgula "
                              f"(multiplos de --nodes-per-container)")
@@ -1224,6 +1239,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     options.k_sizes = int_list("--k-sizes", options.k_sizes)
     if options.nodes_per_container <= 0:
         parser.error("--nodes-per-container precisa ser positivo")
+    if options.fill_workers <= 0:
+        parser.error("--fill-workers precisa ser positivo")
     largest = max(options.nodes) + 1
     if largest > HTTP_PORT_OFFSET:
         parser.error(f"com {largest} nos as portas kademlia invadiriam a faixa HTTP (+{HTTP_PORT_OFFSET})")
