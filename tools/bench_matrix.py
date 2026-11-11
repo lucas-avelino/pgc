@@ -49,6 +49,12 @@ Varios nos por container, como nas rodadas antigas:
 
     python tools/bench_matrix.py --nodes-per-container 8
 
+Em outra faixa de portas (quando a 4000-4128 / 5000-5128 ja esta em uso na
+maquina): o bootstrap fica em --base-port, os servers nas seguintes e o HTTP
+de cada no em +1000. Os node ids continuam os mesmos, so as portas andam:
+
+    python tools/bench_matrix.py --base-port 14000
+
 Rodada rapida de validacao (2 grupos, 2000 imagens no fill, 50 buscas):
 
     python tools/bench_matrix.py --only emb1024_rf2_k10_n64,emb1024_rf1_k10_n64 \
@@ -79,6 +85,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 os.chdir(REPO_ROOT)
 sys.path.insert(0, str(REPO_ROOT))
 
+# porta do bootstrap no node_identities.json; a rede pode subir em outra faixa
+# com --base-port, deslocando todas as portas do mapa pela mesma diferenca
 BOOTSTRAP_PORT = 4000
 HTTP_PORT_OFFSET = 1000
 KEY_SIZE_BITS = 64            # tamanho da chave da rede, igual ao env.Vars.KEY_SIZE
@@ -178,6 +186,7 @@ OVERRIDE_TEMPLATE = """# gerado por tools/bench_matrix.py -- grupo {label}
 services:
   bootstrap:
     environment:
+      LISTEN_PORT: "{base_port}"
       K_SIZE: "{k_size}"
       REPLICATION_FACTOR: "{replication_factor}"
       SERVER_COUNT: "{total_nodes}"
@@ -187,6 +196,8 @@ services:
       PERSIST_PATH: /app/{bootstrap_persist}
   server:
     environment:
+      LISTEN_PORT: "{server_port}"
+      BOOTSTRAP_ADDR: "localhost:{base_port}"
       K_SIZE: "{k_size}"
       REPLICATION_FACTOR: "{replication_factor}"
       SERVER_COUNT: "{total_nodes}"
@@ -236,6 +247,7 @@ class Config:
     k_size: int
     server_nodes: int
     nodes_per_container: int = DEFAULT_NODES_PER_CONTAINER
+    base_port: int = BOOTSTRAP_PORT
 
     @property
     def label(self) -> str:
@@ -266,7 +278,7 @@ class Config:
         return self.server_nodes // self.nodes_per_container
 
     def http_ports(self) -> List[int]:
-        return [BOOTSTRAP_PORT + HTTP_PORT_OFFSET + index for index in range(self.total_nodes)]
+        return [self.base_port + HTTP_PORT_OFFSET + index for index in range(self.total_nodes)]
 
     @property
     def embeddings_dir(self) -> Path:
@@ -298,6 +310,8 @@ class Config:
             "total_nodes": self.total_nodes,
             "replicas": self.replicas,
             "nodes_per_process": self.nodes_per_container,
+            "base_port": self.base_port,
+            "http_base_port": self.base_port + HTTP_PORT_OFFSET,
             "hamming_ground_truth": display_path(self.hamming_ground_truth),
             "clip_ground_truth": display_path(CLIP_GROUND_TRUTH),
         }
@@ -309,6 +323,7 @@ def build_configs(
     replication_factors: Sequence[int],
     k_sizes: Sequence[int],
     nodes_per_container: int = DEFAULT_NODES_PER_CONTAINER,
+    base_port: int = BOOTSTRAP_PORT,
 ) -> List[Config]:
     # com os valores padrao, a primeira combinacao e a configuracao padrao do
     # repositorio (rede do compose, embeddings-1024, REPLICATION_FACTOR=2, K_SIZE=10)
@@ -325,6 +340,7 @@ def build_configs(
             k_size=k_size,
             server_nodes=nodes,
             nodes_per_container=nodes_per_container,
+            base_port=base_port,
         )
         for nodes in node_counts
         for embeddings in embeddings_list
@@ -422,8 +438,14 @@ def identities_for(identities: Dict[str, Any], server_nodes: int) -> Dict[str, A
     return {**identities, "total_nodes": server_nodes + 1, "servers": identities["servers"][:server_nodes]}
 
 
-def reset_persistence(identities: Dict[str, Any]) -> None:
-    """Zera o conteudo dos nos e reescreve os node.txt com os ids fixos."""
+def reset_persistence(identities: Dict[str, Any], base_port: int = BOOTSTRAP_PORT) -> None:
+    """
+    Zera o conteudo dos nos e reescreve os node.txt com os ids fixos.
+
+    As portas do mapa de identidades sao relativas ao BOOTSTRAP_PORT; com outro
+    base_port todas andam pela mesma diferenca (o node.txt manda na porta do no).
+    """
+    shift = base_port - BOOTSTRAP_PORT
     expected = {entry["slot"] for entry in identities["servers"]}
 
     PERSIST_DIR.mkdir(parents=True, exist_ok=True)
@@ -438,15 +460,18 @@ def reset_persistence(identities: Dict[str, Any]) -> None:
         slot_dir = PERSIST_DIR / entry["slot"]
         slot_dir.mkdir(parents=True, exist_ok=True)
         (slot_dir / "state.pkl").unlink(missing_ok=True)
-        (slot_dir / NODE_FILE_NAME).write_text(f"{entry['node_id']}\n{entry['port']}\n", encoding="utf-8")
+        (slot_dir / NODE_FILE_NAME).write_text(f"{entry['node_id']}\n{entry['port'] + shift}\n", encoding="utf-8")
 
     bootstrap = identities["bootstrap"]
     shutil.rmtree(BOOTSTRAP_PERSIST_DIR, ignore_errors=True)
     slot_dir = BOOTSTRAP_PERSIST_DIR / bootstrap["slot"]
     slot_dir.mkdir(parents=True, exist_ok=True)
-    (slot_dir / NODE_FILE_NAME).write_text(f"{bootstrap['node_id']}\n{bootstrap['port']}\n", encoding="utf-8")
+    (slot_dir / NODE_FILE_NAME).write_text(f"{bootstrap['node_id']}\n{bootstrap['port'] + shift}\n", encoding="utf-8")
 
-    log(f"persistencia zerada: {len(identities['servers'])} slots de server + 1 slot de bootstrap")
+    log(
+        f"persistencia zerada: {len(identities['servers'])} slots de server + 1 slot de bootstrap "
+        f"(portas a partir de {base_port})"
+    )
 
 
 # ------------------------------------------------------------------------ docker
@@ -490,6 +515,8 @@ def write_override(config: Config, destination: Path) -> Path:
             replicas=config.replicas,
             nodes_per_container=config.nodes_per_container,
             bootstrap_persist=BOOTSTRAP_PERSIST_DIRNAME,
+            base_port=config.base_port,
+            server_port=config.base_port + 1,
         ),
         encoding="utf-8",
     )
@@ -952,7 +979,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         log("derrubando qualquer rede que esteja de pe")
         run_compose(override, "down", "--remove-orphans", "-t", "30", check=False)
 
-        reset_persistence(identities)
+        reset_persistence(identities, config.base_port)
 
         log(
             f"subindo {config.total_nodes} nos ({config.replicas} containers x {config.nodes_per_container} "
@@ -1147,6 +1174,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                              f"(multiplos de --nodes-per-container)")
     parser.add_argument("--nodes-per-container", type=int, default=DEFAULT_NODES_PER_CONTAINER,
                         help="nos de server por container (as rodadas antigas usavam 8)")
+    parser.add_argument("--base-port", type=int, default=BOOTSTRAP_PORT,
+                        help=f"porta kademlia do bootstrap; os servers usam as seguintes e o HTTP "
+                             f"de cada no fica em +{HTTP_PORT_OFFSET}")
     parser.add_argument("--embeddings", default=",".join(EMBEDDINGS),
                         help=f"pastas de embeddings da matriz, separadas por virgula ({', '.join(EMBEDDINGS)})")
     parser.add_argument("--replication-factors", "--rf", dest="replication_factors",
@@ -1194,6 +1224,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     options.k_sizes = int_list("--k-sizes", options.k_sizes)
     if options.nodes_per_container <= 0:
         parser.error("--nodes-per-container precisa ser positivo")
+    largest = max(options.nodes) + 1
+    if largest > HTTP_PORT_OFFSET:
+        parser.error(f"com {largest} nos as portas kademlia invadiriam a faixa HTTP (+{HTTP_PORT_OFFSET})")
+    if options.base_port < 1024 or options.base_port + HTTP_PORT_OFFSET + largest - 1 > 65535:
+        parser.error(f"--base-port {options.base_port}: a faixa de portas precisa ficar entre 1024 e 65535")
     if options.nodes_per_container > 1 and "NODES_PER_PROC" not in COMPOSE_FILE.read_text(encoding="utf-8"):
         parser.error(f"{COMPOSE_FILE.name} roda um no por container; use o docker-compose.multi.yml")
 
@@ -1212,7 +1247,8 @@ async def main_async(options: argparse.Namespace) -> int:
     LOG_SINKS.append(options.results_dir / "bench_matrix.log")
 
     configs = build_configs(
-        options.nodes, options.embeddings, options.replication_factors, options.k_sizes, options.nodes_per_container
+        options.nodes, options.embeddings, options.replication_factors, options.k_sizes,
+        options.nodes_per_container, options.base_port,
     )
 
     def matches(config: Config, labels: set[str]) -> bool:
@@ -1260,8 +1296,8 @@ async def main_async(options: argparse.Namespace) -> int:
     )
     largest = max(options.nodes) + 1
     log(
-        f"portas kademlia {BOOTSTRAP_PORT}-{BOOTSTRAP_PORT + largest - 1}, "
-        f"HTTP {BOOTSTRAP_PORT + HTTP_PORT_OFFSET}-{BOOTSTRAP_PORT + HTTP_PORT_OFFSET + largest - 1} "
+        f"portas kademlia {options.base_port}-{options.base_port + largest - 1}, "
+        f"HTTP {options.base_port + HTTP_PORT_OFFSET}-{options.base_port + HTTP_PORT_OFFSET + largest - 1} "
         f"(na maior rede)"
     )
 
@@ -1315,7 +1351,7 @@ async def main_async(options: argparse.Namespace) -> int:
         write_matrix_summary(ordered_summaries(), options.results_dir)
 
     if not options.keep_last_persist:
-        reset_persistence(identities)
+        reset_persistence(identities, options.base_port)
         log("persistencia local zerada; as redes ficaram guardadas em " + str(options.networks_dir))
 
     write_matrix_summary(ordered_summaries(), options.results_dir)
