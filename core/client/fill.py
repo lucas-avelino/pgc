@@ -1,9 +1,11 @@
+import asyncio
 import os
 import json
 import time
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor
 
+import aiohttp
 import requests
 from tqdm import tqdm
 from requests.adapters import HTTPAdapter
@@ -250,92 +252,112 @@ async def store_chunks(
     window_size: int | None = None,
     hash_size_bits: int = 64,
     failure_report_path: str = "fill_failed_requests.json",
+    timeout_seconds: float = 5,
 ) -> tuple[int, float]:
-    if window_size is None:
-        window_size = max_workers * 4  
+    """
+    Faz o PUT de cada chunk dos .bin de base_path, com max_workers PUTs simultaneos.
+
+    Roda num unico event loop com aiohttp: sem threads disputando o GIL e sem
+    esperar sobre uma janela de futures, o que limitava a versao com
+    ThreadPoolExecutor + requests a ~1 nucleo de CPU. window_size ficou so por
+    compatibilidade -- a quantidade de PUTs em andamento e max_workers.
+    """
+    del window_size
 
     gen = chunk_generator(base_path, hash_size_bits)
-    pending = set()
+    total_chunks = count_chunks(base_path, hash_size_bits, hard_limit)
 
     count = 0
     finished_count = 0
     ok_count = 0
-    failed_count = 0
-    start_time = time.time()
-    file_stats = {}
     failures = []
-    total_chunks = count_chunks(base_path, hash_size_bits, hard_limit)
+    last_file = ""
 
-    with (
-        make_session(env.Vars.SERVER_COUNT, max_workers) as session,
-        ThreadPoolExecutor(max_workers=max_workers) as executor,
-        tqdm(total=total_chunks, unit="chunk", desc="fill") as progress,
-    ):
+    def next_chunk():
+        nonlocal count
+        if count >= hard_limit:
+            return None
+        try:
+            key, file, _ = next(gen)
+        except StopIteration:
+            return None
+        idx = count
+        count += 1
+        return idx, key, file
 
-        def submit_next() -> bool:
-            nonlocal count
-            if count >= hard_limit:
-                return False
-            try:
-                key, file, total_chunks = next(gen)
-            except StopIteration:
-                return False
-            if file not in file_stats:
-                file_stats[file] = {
-                    "total": total_chunks,
-                    "finished": 0,
-                    "ok": 0,
-                    "failed": 0,
-                    "start_time": time.time(),
-                }
-            fut = executor.submit(store_chunk, session, urls, key, file, count)
-            pending.add(fut)
-            count += 1
-            return True
-
-        # preenche a janela inicial de tasks pendentes
-        for _ in range(window_size):
-            if not submit_next():
-                break
-
-        # consome resultados conforme terminam e repõe a janela
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-
-            for fut in done:
-                result = fut.result()
-                file = result["value"]
-                finished_count += 1
-                stats = file_stats[file]
-                stats["finished"] += 1
-                if result["status_code"] == 200:
-                    stats["ok"] += 1
-                    ok_count += 1
+    async def put(session: aiohttp.ClientSession, idx: int, key: str, file: str) -> None:
+        nonlocal finished_count, ok_count, last_file
+        request = {
+            "method": "POST",
+            "url": f"{urls[idx % len(urls)]}/put",
+            "json": {"key": key, "value": file},
+            "timeout_seconds": timeout_seconds,
+        }
+        status_code = None
+        body = None
+        error = None
+        try:
+            async with session.post(request["url"], json=request["json"]) as response:
+                status_code = response.status
+                if status_code != 200:
+                    body = await response.text()
                 else:
-                    stats["failed"] += 1
-                    failed_count += 1
-                    failures.append({
-                        "idx": result["idx"],
-                        "file": file,
-                        "key": result["key"],
-                        "request": result["request"],
-                        "response": {
-                            "status_code": result["status_code"],
-                            "body": result["response_body"],
-                        },
-                        "error": result["error"],
-                    })
-                progress.update(1)
-                progress.set_postfix(
-                    ok=ok_count,
-                    failed=failed_count,
-                    submitted=count,
-                    file=file,
-                    refresh=False,
-                )
+                    await response.read()
+        except Exception as e:  # timeout, conexao recusada...
+            error = f"{type(e).__name__}: {e}"
 
-            for _ in range(len(done)):
-                submit_next()
+        finished_count += 1
+        last_file = file
+        if status_code == 200:
+            ok_count += 1
+            return
+        failures.append({
+            "idx": idx,
+            "file": file,
+            "key": key,
+            "request": request,
+            "response": {"status_code": status_code, "body": body},
+            "error": error,
+        })
+
+    async def worker(session: aiohttp.ClientSession) -> None:
+        while True:
+            item = next_chunk()
+            if item is None:
+                return
+            await put(session, *item)
+
+    async def report_progress(progress: tqdm) -> None:
+        # atualizar o tqdm a cada chunk custava CPU do proprio cliente
+        shown = 0
+        while True:
+            await asyncio.sleep(0.5)
+            progress.update(finished_count - shown)
+            shown = finished_count
+            progress.set_postfix(
+                ok=ok_count,
+                failed=len(failures),
+                submitted=count,
+                file=last_file,
+                refresh=False,
+            )
+
+    connector = aiohttp.TCPConnector(limit=max_workers, limit_per_host=0, ttl_dns_cache=300)
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    start_time = time.time()
+    with tqdm(total=total_chunks, unit="chunk", desc="fill") as progress:
+        reporter = asyncio.create_task(report_progress(progress))
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                await asyncio.gather(*(worker(session) for _ in range(max_workers)))
+        finally:
+            reporter.cancel()
+            try:
+                await reporter
+            except asyncio.CancelledError:
+                pass
+        progress.update(finished_count - progress.n)
+        progress.set_postfix(ok=ok_count, failed=len(failures), submitted=count, refresh=True)
 
     elapsed = time.time() - start_time
     report = {
