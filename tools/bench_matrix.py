@@ -60,6 +60,11 @@ so compare grupos rodados com o mesmo valor):
 
     python tools/bench_matrix.py --fill-workers 256
 
+Fill dividido em varios processos de cliente (cada um com --fill-workers PUTs
+simultaneos; um processo Python sozinho satura um nucleo):
+
+    python tools/bench_matrix.py --fill-processes 4 --fill-workers 128
+
 Rodada rapida de validacao (2 grupos, 2000 imagens no fill, 50 buscas):
 
     python tools/bench_matrix.py --only emb1024_rf2_k10_n64,emb1024_rf1_k10_n64 \
@@ -165,8 +170,8 @@ import requests  # noqa: E402
 from core.cli import get_near  # noqa: E402
 from core.shared import env  # noqa: E402
 from core.client.consumer import Client  # noqa: E402
-from core.client.fill import store_chunks  # noqa: E402
-from core.client.recall import RECALL_KS, measure_recall, percentile  # noqa: E402
+from core.client.fill import store_chunks_parallel  # noqa: E402
+from core.client.recall import RECALL_KS, load_embeddings, measure_recall, percentile  # noqa: E402
 from core.client.utils import write_json  # noqa: E402
 
 EMBEDDINGS = {
@@ -187,6 +192,8 @@ LEGACY_NODES_PER_CONTAINER = 8
 DEFAULT_NODES_PER_CONTAINER = 1
 # PUTs simultaneos no fill (o padrao do store_chunks, usado em todas as rodadas antigas)
 DEFAULT_FILL_WORKERS = 64
+# processos de cliente no fill (as rodadas antigas usavam um so)
+DEFAULT_FILL_PROCESSES = 1
 
 OVERRIDE_TEMPLATE = """# gerado por tools/bench_matrix.py -- grupo {label}
 # {group}
@@ -733,17 +740,27 @@ def build_query_sample(configs: Sequence[Config], amount: int, seed: int, cache_
 
 
 async def run_fill(
-    config: Config, urls: List[str], out_dir: Path, hard_limit: int, workers: int = DEFAULT_FILL_WORKERS
+    config: Config,
+    urls: List[str],
+    out_dir: Path,
+    hard_limit: int,
+    workers: int = DEFAULT_FILL_WORKERS,
+    processes: int = DEFAULT_FILL_PROCESSES,
 ) -> Dict[str, Any]:
-    log(f"fill de {config.embeddings_dir} (limite de {hard_limit} chunks, {workers} requisicoes simultaneas)")
+    log(
+        f"fill de {config.embeddings_dir} (limite de {hard_limit} chunks, {processes} processo(s) x "
+        f"{workers} requisicoes simultaneas)"
+    )
     started = time.time()
-    submitted, elapsed = await store_chunks(
+    submitted, elapsed = await store_chunks_parallel(
         str(config.embeddings_dir),
         urls,
+        processes=processes,
         hard_limit=hard_limit,
         max_workers=workers,
         hash_size_bits=KEY_SIZE_BITS,
         failure_report_path=str(out_dir / "fill_failed_requests.json"),
+        log=log,
     )
     report = json.loads((out_dir / "fill_failed_requests.json").read_text(encoding="utf-8"))
     failures = report.get("failure_count", 0)
@@ -752,6 +769,7 @@ async def run_fill(
         "hash_size_bits": KEY_SIZE_BITS,
         "hard_limit": hard_limit,
         "workers": workers,
+        "processes": processes,
         "chunks_submitted": submitted,
         "chunks_failed": failures,
         "chunks_ok": submitted - failures,
@@ -1016,7 +1034,13 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         hard_limit = options.fill_limit or (
             options.fill_images * config.chunks_per_image if options.fill_images else 10 ** 9
         )
-        fill = await run_fill(config, urls, out_dir, hard_limit, options.fill_workers)
+        fill = await run_fill(config, urls, out_dir, hard_limit, options.fill_workers, options.fill_processes)
+
+        # o rank_by_hamming carrega todos os embeddings na primeira busca; carregando
+        # aqui, essa leitura nao cai dentro do tempo da primeira busca medida
+        started_load = time.time()
+        embeddings_loaded = len(load_embeddings(str(config.embeddings_dir)))
+        log(f"{embeddings_loaded} embeddings carregados para o ranqueamento em {human_time(time.time() - started_load)}")
 
         client = Client(urls=urls)
         try:
@@ -1133,6 +1157,7 @@ def write_matrix_summary(summaries: Sequence[Dict[str, Any]], results_dir: Path)
             "fill_tempo": fill["elapsed_human"],
             "fill_chunks_s": fill["chunks_per_second"],
             "fill_workers": fill.get("workers", DEFAULT_FILL_WORKERS),
+            "fill_processos": fill.get("processes", DEFAULT_FILL_PROCESSES),
             "buscas": sequential["queries_ok"],
             "resultados_por_busca": round(sequential["avg_results_per_query"], 2),
             "hamming_coverage": round(hamming["coverage"], 4),
@@ -1182,8 +1207,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fill-limit", type=int, default=None,
                         help="limite bruto de chunks no fill; tem prioridade sobre --fill-images")
     parser.add_argument("--fill-workers", type=int, default=DEFAULT_FILL_WORKERS,
-                        help="PUTs simultaneos no fill; a vazao do fill depende dele, entao compare "
-                             "grupos rodados com o mesmo valor")
+                        help="PUTs simultaneos no fill, por processo; a vazao do fill depende dele, "
+                             "entao compare grupos rodados com o mesmo valor")
+    parser.add_argument("--fill-processes", type=int, default=DEFAULT_FILL_PROCESSES,
+                        help="processos de cliente no fill, cada um com --fill-workers PUTs simultaneos "
+                             "(um processo Python satura um nucleo)")
     parser.add_argument("--nodes", default=",".join(str(nodes) for nodes in NODE_COUNTS),
                         help=f"quantidades de nos de server da matriz, separadas por virgula "
                              f"(multiplos de --nodes-per-container)")
@@ -1241,6 +1269,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--nodes-per-container precisa ser positivo")
     if options.fill_workers <= 0:
         parser.error("--fill-workers precisa ser positivo")
+    if options.fill_processes <= 0:
+        parser.error("--fill-processes precisa ser positivo")
     largest = max(options.nodes) + 1
     if largest > HTTP_PORT_OFFSET:
         parser.error(f"com {largest} nos as portas kademlia invadiriam a faixa HTTP (+{HTTP_PORT_OFFSET})")
