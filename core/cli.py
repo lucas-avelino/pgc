@@ -14,17 +14,28 @@ from core.client.utils import write_file, write_json
 from core.client.fill import retry_failed_requests, store_chunks
 from core.shared import env
 
-async def get_near(client: Client, command: List[str], write_output: bool = True) -> Tuple[Dict[str, any], Dict[str, timedelta]]:
+async def fetch_near(client: Client, embedding_file: str, key_size: int, radius: int) -> Tuple[List[dict], int, Dict[str, timedelta]]:
+  """
+  So a parte de rede da busca: um /get_near por chunk do embedding, todos juntos.
+
+  Devolve as respostas cruas, a quantidade de chaves e os tempos (leitura do
+  arquivo e requisicoes). O agrupamento e o ranqueamento ficam em
+  group_responses, para quem quer medir a rede sem o pos-processamento do cliente.
+  """
   start_time = datetime.now()
-  keys = embedding_file_to_keys(command[1], int(command[2]))
+  keys = embedding_file_to_keys(embedding_file, key_size)
   read_file_time = datetime.now()
 
-  tasks = [client.get_near(k, int(command[3])) for k in keys]
+  tasks = [client.get_near(k, radius) for k in keys]
   responses = await asyncio.gather(*tasks)
   request_time = datetime.now()
-  if write_output:
-    write_json(f"{env.Vars.RESULT_FOLDER_PREFIX}responses.json", responses)
-  
+  return responses, len(keys), {
+    "read_file_time": read_file_time - start_time,
+    "request_time": request_time - read_file_time,
+  }
+
+def group_responses(responses: List[dict], keys_count: int, key_size: int, embedding_file: str, include_results: bool = False) -> List[Dict[str, any]]:
+  """Agrupa as respostas por imagem e ordena pela distancia de Hamming real (pos-processamento do cliente)."""
   grouped = {}
   for response in responses:
       key = response['key']
@@ -40,7 +51,7 @@ async def get_near(client: Client, command: List[str], write_output: bool = True
         grouped[result["value"]]["total_distance"] += result["distance"]
         grouped[result["value"]]["amount_of_close_keys"] += 1
 
-        if len(command) > 4 and command[4] in ["1", "true"]:
+        if include_results:
           grouped[result["value"]]["results"].append({
               "search_key": key,
               "actual_key": result["key"],
@@ -49,24 +60,30 @@ async def get_near(client: Client, command: List[str], write_output: bool = True
           })
 
   for key in grouped:
-    missed_keys = len(keys) - grouped[key]["amount_of_close_keys"]
-    grouped[key]["total_distance"] = grouped[key]["total_distance"] + (missed_keys * int(command[2]))
+    missed_keys = keys_count - grouped[key]["amount_of_close_keys"]
+    grouped[key]["total_distance"] = grouped[key]["total_distance"] + (missed_keys * key_size)
 
   #to array
   grouped = [{"value": key, **grouped[key]} for key in grouped]
   # ordem final e por distancia de Hamming real contra o embedding da query;
   # total_distance (ordem da rede) continua em cada entrada como desempate
-  grouped = rank_by_hamming(grouped, command[1], os.path.dirname(command[1]) or ".")
+  return rank_by_hamming(grouped, embedding_file, os.path.dirname(embedding_file) or ".")
+
+async def get_near(client: Client, command: List[str], write_output: bool = True) -> Tuple[Dict[str, any], Dict[str, timedelta]]:
+  key_size = int(command[2])
+  responses, keys_count, times = await fetch_near(client, command[1], key_size, int(command[3]))
+  if write_output:
+    write_json(f"{env.Vars.RESULT_FOLDER_PREFIX}responses.json", responses)
+
+  include_results = len(command) > 4 and command[4] in ["1", "true"]
+  grouped = group_responses(responses, keys_count, key_size, command[1], include_results)
 
   if write_output:
     write_json(f"{env.Vars.RESULT_FOLDER_PREFIX}grouped_responses.json", grouped)
     print(f"Responses written to responses.json")
-    print(f"Time taken to read file: {read_file_time - start_time}")
-    print(f"Time taken to process requests: {request_time - read_file_time}")
-  return grouped, {
-    "read_file_time": read_file_time - start_time,
-    "request_time": request_time - read_file_time,
-  }
+    print(f"Time taken to read file: {times['read_file_time']}")
+    print(f"Time taken to process requests: {times['request_time']}")
+  return grouped, times
 
 def ho_get_near(client: Client) -> callable:
   async def _call(command: List[str], write_output: bool = True):

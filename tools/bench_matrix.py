@@ -17,7 +17,12 @@ REPLICATION_FACTOR x K_SIZE) o script:
 
 Nada do codigo da rede e alterado: o script so gera um override de compose com
 os parametros do grupo e reaproveita as funcoes que ja existem em core/ e
-tools/ (store_chunks, get_near, measure_recall, tools/top500.py).
+tools/ (store_chunks, fetch_near/group_responses, measure_recall, tools/top500.py).
+
+As buscas medem so a rede: o tempo de cada busca vai do disparo das requisicoes
+ate a ultima resposta chegar. O agrupamento e o ranqueamento por Hamming (pos-
+processamento do cliente) rodam depois, fora desse tempo, e sao medidos a parte
+(ranking_latency); no lote paralelo nem rodam, porque o recall sai do sequencial.
 
 A quantidade de nos de server e uma variavel da matriz (--nodes). O override
 de cada grupo troca o numero de replicas do service server e o NODES_PER_PROC
@@ -186,7 +191,7 @@ os.environ["SERVER_COUNT"] = str(TOTAL_NODES)
 
 import requests  # noqa: E402
 
-from core.cli import get_near  # noqa: E402
+from core.cli import fetch_near, group_responses  # noqa: E402
 from core.shared import env  # noqa: E402
 from core.client.consumer import Client  # noqa: E402
 from core.client.fill import store_chunks_parallel  # noqa: E402
@@ -874,11 +879,14 @@ async def run_fill(
 
 
 async def query_once(client: Client, config: Config, name: str, radius: int, timeout: float):
+    """So a rede: as requisicoes da busca, sem agrupar nem ranquear (respostas, n de chaves, tempos)."""
     path = str(config.embeddings_dir / name)
-    return await asyncio.wait_for(
-        get_near(client, ["get_near_files", path, str(KEY_SIZE_BITS), str(radius)], write_output=False),
-        timeout=timeout,
-    )
+    return await asyncio.wait_for(fetch_near(client, path, KEY_SIZE_BITS, radius), timeout=timeout)
+
+
+def post_process(config: Config, name: str, responses: List[dict], keys_count: int) -> List[Dict[str, Any]]:
+    """Pos-processamento do cliente: agrupa por imagem e ranqueia por Hamming."""
+    return group_responses(responses, keys_count, KEY_SIZE_BITS, str(config.embeddings_dir / name))
 
 
 async def run_sequential(
@@ -888,28 +896,43 @@ async def run_sequential(
     failures: List[Dict[str, str]] = []
     started = time.time()
 
+    window: List[Dict[str, Any]] = []
     for index, name in enumerate(files, start=1):
         query_start = time.perf_counter()
         try:
-            grouped, times = await query_once(client, config, name, radius, timeout)
+            responses, keys_count, times = await query_once(client, config, name, radius, timeout)
         except Exception as error:  # timeout, conexao recusada, json invalido...
             failures.append({"file": name, "error": f"{type(error).__name__}: {error}"})
             log(f"  [{index}/{len(files)}] {name}: FALHOU ({type(error).__name__})")
             continue
-        records.append({
+        network_seconds = time.perf_counter() - query_start
+
+        # a busca ja terminou: ranquear agora nao entra no tempo de rede e, como
+        # nao ha outra busca em andamento, nao atrasa nenhuma
+        post_start = time.perf_counter()
+        grouped = post_process(config, name, responses, keys_count)
+        ranking_seconds = time.perf_counter() - post_start
+
+        record = {
             "name": name,
             "grouped": grouped,
             "times": times,
-            "wall_seconds": time.perf_counter() - query_start,
-        })
+            "network_seconds": network_seconds,
+            "ranking_seconds": ranking_seconds,
+            "wall_seconds": network_seconds + ranking_seconds,
+        }
+        records.append(record)
+        window.append(record)
         if index % 50 == 0 or index == len(files):
-            done = len(records)
-            average = sum(record["wall_seconds"] for record in records) / max(done, 1)
+            # media do bloco, nao a acumulada (a acumulada esconde picos e warmup)
+            network = sum(item["network_seconds"] for item in window) / max(len(window), 1)
+            ranking = sum(item["ranking_seconds"] for item in window) / max(len(window), 1)
             log(
-                f"  [{index}/{len(files)}] buscas sequenciais, "
-                f"{average:.3f}s por busca, {len(failures)} falhas, "
+                f"  [{index}/{len(files)}] buscas sequenciais, ultimas {len(window)}: "
+                f"rede {network:.3f}s + ranqueamento {ranking:.3f}s por busca, {len(failures)} falhas, "
                 f"decorrido {human_time(time.time() - started)}"
             )
+            window = []
     return records, failures
 
 
@@ -1189,6 +1212,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
 
             sequential_latencies = [record["times"]["request_time"].total_seconds() for record in records]
             sequential_wall = sum(record["wall_seconds"] for record in records)
+            sequential_network = sum(record["network_seconds"] for record in records)
             speed = {
                 "params": {
                     "queries": len(sequential_files),
@@ -1203,9 +1227,16 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
                     "queries_ok": len(records),
                     "queries_failed": len(query_failures),
                     "wall_seconds": round(sequential_wall, 3),
+                    # rede + ranqueamento, uma busca por vez (como um usuario sentiria)
                     "queries_per_second": round(len(records) / sequential_wall, 3) if sequential_wall else None,
+                    # so a rede
+                    "network_queries_per_second": (
+                        round(len(records) / sequential_network, 3) if sequential_network else None
+                    ),
                     "request_latency": latency_stats(sequential_latencies),
                     "wall_latency": latency_stats([record["wall_seconds"] for record in records]),
+                    "network_latency": latency_stats([record["network_seconds"] for record in records]),
+                    "ranking_latency": latency_stats([record["ranking_seconds"] for record in records]),
                     "avg_results_per_query": sum(len(record["grouped"]) for record in records) / len(records),
                 },
                 "parallel": None,
