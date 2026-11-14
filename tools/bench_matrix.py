@@ -913,6 +913,9 @@ async def run_sequential(
     return records, failures
 
 
+PARALLEL_PROGRESS_SECONDS = 30  # intervalo do log de progresso do lote paralelo
+
+
 async def run_parallel(
     client: Client, config: Config, files: Sequence[str], radius: int, concurrency: int, timeout: float
 ) -> Dict[str, Any]:
@@ -932,8 +935,32 @@ async def run_parallel(
                 return
             latencies.append(time.perf_counter() - query_start)
 
+    async def report_progress() -> None:
+        # sem isso o lote passa minutos sem escrever nada (e a sessao SSH ociosa cai)
+        shown = 0
+        while True:
+            await asyncio.sleep(PARALLEL_PROGRESS_SECONDS)
+            elapsed = time.perf_counter() - started
+            done = len(latencies) + failures
+            recent = latencies[shown:]
+            shown = len(latencies)
+            recent_latency = f"{sum(recent) / len(recent):.3f}s" if recent else "-"
+            log(
+                f"  [{done}/{len(files)}] lote paralelo, {len(latencies) / elapsed:.2f} buscas/s, "
+                f"latencia media nos ultimos {PARALLEL_PROGRESS_SECONDS}s {recent_latency}, "
+                f"{failures} falhas, decorrido {human_time(elapsed)}"
+            )
+
     started = time.perf_counter()
-    await asyncio.gather(*(one(name) for name in files))
+    reporter = asyncio.create_task(report_progress())
+    try:
+        await asyncio.gather(*(one(name) for name in files))
+    finally:
+        reporter.cancel()
+        try:
+            await reporter
+        except asyncio.CancelledError:
+            pass
     wall = time.perf_counter() - started
 
     result = {
