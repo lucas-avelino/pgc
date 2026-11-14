@@ -13,7 +13,8 @@ REPLICATION_FACTOR x K_SIZE) o script:
   6. roda N buscas (padrao 1000) medindo recall contra os dois ground truths
      (hamming em data/top500* e clip em data/top500-clip) e a latencia;
   7. roda o mesmo lote em paralelo para medir vazao;
-  8. derruba a rede e copia a persistencia para ../networks/<grupo>/.
+  8. registra qual container rodou cada slot (nodes.csv), derruba a rede e
+     copia a persistencia para a pasta de resultados do grupo (<grupo>/rede/).
 
 Nada do codigo da rede e alterado: o script so gera um override de compose com
 os parametros do grupo e reaproveita as funcoes que ja existem em core/ e
@@ -34,8 +35,8 @@ de nos por container. As rodadas antigas usavam 8 nos por container; os
 grupos de 128 nos com 8 por container reaproveitam tambem as pastas de antes
 de a quantidade de nos entrar na matriz (sem o sufixo _n128). Quando um grupo
 e refeito com outro arranjo, os resultados anteriores vao para
-<results-dir>/_substituidos/ e ../networks/_substituidos/ em vez de serem
-apagados.
+<results-dir>/<run-name>/_substituidos/ (com a copia da rede junto) em vez de
+serem apagados.
 
 Uso tipico (dataset inteiro, 1000 buscas por grupo):
 
@@ -75,9 +76,10 @@ CPU e memoria de cada no, do cliente e da maquina sao amostradas a cada
 fase da rodada em cada linha; o resumo por fase vai para o summary.json.
 
 Cada execucao grava em uma pasta propria, com o horario em que comecou:
-<results-dir>/<AAAA-MM-DD_HH-MM-SS>/<grupo>/ e as copias das redes em
-<networks-dir>/<AAAA-MM-DD_HH-MM-SS>/<grupo>/, entao nada de uma execucao anterior
-e sobrescrito. --run-name escolhe o nome da pasta; repetir o nome de uma execucao
+<results-dir>/<AAAA-MM-DD_HH-MM-SS>/<grupo>/, entao nada de uma execucao anterior
+e sobrescrito. A copia da persistencia da rede fica junto, em <grupo>/rede/, e
+<grupo>/nodes.csv liga cada no ao container, ao slot de persistencia, ao node id
+e as portas. --run-name escolhe o nome da pasta; repetir o nome de uma execucao
 ja existente retoma ela, pulando os grupos que ja tem summary.json. O
 node_identities.json e a amostra de consultas continuam na raiz de cada pasta,
 compartilhados entre as execucoes.
@@ -1100,8 +1102,88 @@ def set_aside(path: Path, reason: str) -> None:
     log(f"{path} guardado em {destination}")
 
 
-def backup_network(config: Config, networks_dir: Path, identities: Dict[str, Any], summary: Dict[str, Any]) -> Path:
-    destination = networks_dir / config.label
+NODE_ID_LOG_PATTERN = re.compile(r"Node id: ([0-9a-fA-F]+)")
+
+
+def collect_node_map(override: Path, out_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Liga cada slot de persistencia ao container que o rodou, com a rede ainda de pe.
+
+    Cada no pega o primeiro slot livre ao subir, entao o numero do container nao
+    diz nada sobre o slot. O node.txt de cada slot da o node id e a porta; o log
+    de cada container ("Node id: ...") da o node id que ele rodou; o node id liga
+    os dois. Grava <grupo>/nodes.csv e devolve as linhas.
+    """
+    slots: Dict[str, Tuple[str, int | None]] = {}
+    for base in (PERSIST_DIR, BOOTSTRAP_PERSIST_DIR):
+        for node_file in base.glob(f"slot_*/{NODE_FILE_NAME}"):
+            node_id, port = _read_node_file(node_file)
+            if node_id:
+                slots[node_id.lower()] = (f"{base.name}/{node_file.parent.name}", port)
+
+    ids = run_compose(override, "ps", "-q", check=False, timeout=300, quiet=True).stdout.split()
+    containers = {container["name"]: container["id"] for container in resource_monitor.discover_containers(ids)}
+
+    def container_name(prefix: str) -> str:
+        # o compose prefixa a linha com o nome do container ("pgc-server-80") ou,
+        # dependendo da versao, so com servico-indice ("server-80")
+        if prefix in containers:
+            return prefix
+        matches = [name for name in containers if name.endswith("-" + prefix)]
+        return matches[0] if len(matches) == 1 else prefix
+
+    logs = run_compose(override, "logs", "--no-color", check=False, timeout=600, quiet=True).stdout or ""
+    owner: Dict[str, str] = {}
+    for line in logs.splitlines():
+        prefix, separator, message = line.partition("|")
+        if not separator:
+            continue
+        match = NODE_ID_LOG_PATTERN.search(message)
+        if match:
+            owner[match.group(1).lower()] = container_name(prefix.strip())
+
+    def slot_order(item: Tuple[str, Tuple[str, int | None]]) -> Tuple[str, int]:
+        base, _, slot = item[1][0].partition("/slot_")
+        return (base, int(slot) if slot.isdigit() else -1)
+
+    rows = []
+    for node_id, (slot, port) in sorted(slots.items(), key=slot_order):
+        name = owner.get(node_id, "")
+        rows.append({
+            "slot": slot,
+            "node_id": node_id,
+            "port": port,
+            "http_port": port + HTTP_PORT_OFFSET if port else None,
+            "container": name,
+            "container_id": containers.get(name, ""),
+        })
+
+    path = out_dir / "nodes.csv"
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["slot", "node_id", "port", "http_port", "container", "container_id"])
+        writer.writeheader()
+        writer.writerows(rows)
+    unmatched = sum(1 for row in rows if not row["container"])
+    log(
+        f"mapa de nos em {display_path(path)}: {len(rows)} slots"
+        + (f", {unmatched} sem container identificado nos logs" if unmatched else "")
+    )
+    return rows
+
+
+def annotate_hottest(resources: Dict[str, Any] | None, node_map: Sequence[Dict[str, Any]]) -> None:
+    """Acrescenta slot e node id ao no mais quente de cada fase do monitor."""
+    by_container = {row["container"]: row for row in node_map if row["container"]}
+    for phase in (resources or {}).values():
+        hottest = phase.get("hottest_node") if isinstance(phase, dict) else None
+        if hottest and hottest.get("name") in by_container:
+            row = by_container[hottest["name"]]
+            hottest.update({"slot": row["slot"], "node_id": row["node_id"], "port": row["port"]})
+
+
+def backup_network(config: Config, out_dir: Path, identities: Dict[str, Any]) -> Path:
+    """Copia a persistencia da rede para <grupo>/rede/, junto com os resultados do grupo."""
+    destination = out_dir / "rede"
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True, exist_ok=True)
@@ -1109,7 +1191,6 @@ def backup_network(config: Config, networks_dir: Path, identities: Dict[str, Any
     shutil.copytree(PERSIST_DIR, destination / "persist")
     shutil.copytree(BOOTSTRAP_PERSIST_DIR, destination / BOOTSTRAP_PERSIST_DIRNAME)
     write_json(str(destination / "node_identities.json"), identities)
-    write_json(str(destination / "meta.json"), summary)
 
     size = sum(path.stat().st_size for path in destination.rglob("*") if path.is_file())
     log(f"persistencia copiada para {destination} ({size / 1e6:.1f} MB)")
@@ -1130,7 +1211,6 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         previous = stored_nodes_per_container(json.loads(previous_summary.read_text(encoding="utf-8")))
         if previous != config.nodes_per_container:
             set_aside(out_dir, f"{previous}-por-container")
-            set_aside(options.backups_dir / config.label, f"{previous}-por-container")
     out_dir.mkdir(parents=True, exist_ok=True)
     config_log = out_dir / "run.log"
     LOG_SINKS.append(config_log)
@@ -1255,6 +1335,12 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         log(f"esperando {options.settle_before_down}s para os nos gravarem a persistencia")
         time.sleep(options.settle_before_down)
         resources = monitor.stop()
+        node_map: List[Dict[str, Any]] = []
+        try:
+            node_map = collect_node_map(override, out_dir)
+        except Exception as error:  # o mapa e um extra; sem ele a rodada continua valendo
+            log(f"nao consegui montar o mapa de nos: {type(error).__name__}: {error}")
+        annotate_hottest(resources, node_map)
         log("derrubando a rede")
         run_compose(override, "down", "--remove-orphans", "-t", "60", check=False)
 
@@ -1274,7 +1360,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
             "recall_clip": {key: value for key, value in clip.items() if key != "results"},
             "resources": resources,
         }
-        summary["backup_path"] = str(backup_network(config, options.backups_dir, identities, summary))
+        summary["backup_path"] = str(backup_network(config, out_dir, identities))
         write_json(str(out_dir / "summary.json"), summary)
         log(f"GRUPO {config.label} concluido em {summary['total_human']}")
         return summary
@@ -1427,7 +1513,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--results-dir", type=Path, default=REPO_ROOT / "data" / "results" / "bench",
                         help="pasta base dos resultados; cada execucao grava em <results-dir>/<run-name>/")
     parser.add_argument("--networks-dir", type=Path, default=REPO_ROOT.parent / "networks",
-                        help="pasta base das copias das redes (<networks-dir>/<run-name>/) e do node_identities.json")
+                        help="pasta do node_identities.json (ids fixos dos nos) e da copia da persistencia "
+                             "feita antes de cada bateria")
     parser.add_argument("--run-name", default=None,
                         help="nome da pasta desta execucao (padrao: horario de inicio, AAAA-MM-DD_HH-MM-SS); "
                              "o nome de uma execucao existente retoma ela")
@@ -1496,7 +1583,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(f"--run-name invalido: {options.run_name!r}")
     options.results_base = options.results_dir
     options.results_dir = options.results_base / options.run_name
-    options.backups_dir = options.networks_dir / options.run_name
     return options
 
 
@@ -1505,8 +1591,7 @@ async def main_async(options: argparse.Namespace) -> int:
         options.results_dir.mkdir(parents=True, exist_ok=True)
         options.networks_dir.mkdir(parents=True, exist_ok=True)
         LOG_SINKS.append(options.results_dir / "bench_matrix.log")
-    log(f"execucao {options.run_name}: resultados em {display_path(options.results_dir)}, "
-        f"copias das redes em {display_path(options.backups_dir)}")
+    log(f"execucao {options.run_name}: resultados e copias das redes em {display_path(options.results_dir)}")
 
     configs = build_configs(
         options.nodes, options.embeddings, options.replication_factors, options.k_sizes,
@@ -1617,7 +1702,7 @@ async def main_async(options: argparse.Namespace) -> int:
 
     if not options.keep_last_persist:
         reset_persistence(identities, options.base_port)
-        log("persistencia local zerada; as redes ficaram guardadas em " + str(options.backups_dir))
+        log("persistencia local zerada; as redes ficaram guardadas em " + str(options.results_dir))
 
     write_matrix_summary(ordered_summaries(), options.results_dir)
     ok = sum(1 for summary in summaries if summary.get("status") == "ok")
