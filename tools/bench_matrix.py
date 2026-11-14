@@ -90,6 +90,18 @@ mesmas das sequenciais:
 
     python tools/bench_matrix.py --queries 1000 --parallel-queries 5000
 
+Esquema dos node ids (--id-scheme, tambem e eixo da matriz):
+
+  - random: ids aleatorios, como no Kademlia original (fixos entre execucoes
+    pelo node_identities.json);
+  - equal: o espaco de 64 bits dividido em partes iguais, um no no meio de cada
+    parte (o bootstrap entra na divisao). Modela uma implantacao controlada, em
+    que se escolhe a posicao de cada no. Com o total de nos (servers + bootstrap)
+    potencia de 2, cada no fica dono de exatamente 1/total do espaco; fora disso
+    as regioes XOR variam ate 2x. Os grupos com equal ganham o sufixo _ideq.
+
+    python tools/bench_matrix.py --nodes 127 --id-scheme random,equal
+
 Rodada rapida de validacao (2 grupos, 2000 imagens no fill, 50 buscas):
 
     python tools/bench_matrix.py --only emb1024_rf2_k10_n64,emb1024_rf1_k10_n64 \
@@ -212,6 +224,7 @@ REPLICATION_FACTORS = (2, 1)
 K_SIZES = (10, 20)
 # quantidade de nos de server (o bootstrap fica de fora); o primeiro valor e o do compose
 NODE_COUNTS = (SERVER_NODES, 64, 32)
+ID_SCHEMES = ("random", "equal")
 # os grupos rodados antes de a quantidade de nos entrar na matriz usavam esta rede
 LEGACY_SERVER_NODES = 128
 # e esta quantidade de nos por container (resultados sem o campo valem como 8)
@@ -289,15 +302,21 @@ class Config:
     server_nodes: int
     nodes_per_container: int = DEFAULT_NODES_PER_CONTAINER
     base_port: int = BOOTSTRAP_PORT
+    id_scheme: str = "random"
 
     @property
     def label(self) -> str:
-        return f"emb{self.embeddings}_rf{self.replication_factor}_k{self.k_size}_n{self.server_nodes}"
+        suffix = "_ideq" if self.id_scheme == "equal" else ""
+        return f"emb{self.embeddings}_rf{self.replication_factor}_k{self.k_size}_n{self.server_nodes}{suffix}"
 
     @property
     def legacy_label(self) -> str | None:
         """Nome da pasta dos grupos rodados antes de a quantidade de nos entrar na matriz."""
-        if self.server_nodes != LEGACY_SERVER_NODES or self.nodes_per_container != LEGACY_NODES_PER_CONTAINER:
+        if (
+            self.server_nodes != LEGACY_SERVER_NODES
+            or self.nodes_per_container != LEGACY_NODES_PER_CONTAINER
+            or self.id_scheme != "random"
+        ):
             return None
         return f"emb{self.embeddings}_rf{self.replication_factor}_k{self.k_size}"
 
@@ -307,7 +326,8 @@ class Config:
             f"embeddings-{self.embeddings} | "
             f"REPLICATION_FACTOR={self.replication_factor} | "
             f"K_SIZE={self.k_size} | "
-            f"nos={self.server_nodes} ({self.nodes_per_container} por container)"
+            f"nos={self.server_nodes} ({self.nodes_per_container} por container) | "
+            f"ids {self.id_scheme}"
         )
 
     @property
@@ -351,6 +371,7 @@ class Config:
             "total_nodes": self.total_nodes,
             "replicas": self.replicas,
             "nodes_per_process": self.nodes_per_container,
+            "id_scheme": self.id_scheme,
             "base_port": self.base_port,
             "http_base_port": self.base_port + HTTP_PORT_OFFSET,
             "hamming_ground_truth": display_path(self.hamming_ground_truth),
@@ -365,6 +386,7 @@ def build_configs(
     k_sizes: Sequence[int],
     nodes_per_container: int = DEFAULT_NODES_PER_CONTAINER,
     base_port: int = BOOTSTRAP_PORT,
+    id_schemes: Sequence[str] = ("random",),
 ) -> List[Config]:
     # com os valores padrao, a primeira combinacao e a configuracao padrao do
     # repositorio (rede do compose, embeddings-1024, REPLICATION_FACTOR=2, K_SIZE=10)
@@ -382,8 +404,10 @@ def build_configs(
             server_nodes=nodes,
             nodes_per_container=nodes_per_container,
             base_port=base_port,
+            id_scheme=id_scheme,
         )
         for nodes in node_counts
+        for id_scheme in id_schemes
         for embeddings in embeddings_list
         for replication_factor in replication_factors
         for k_size in k_sizes
@@ -472,6 +496,23 @@ def load_or_build_identities(networks_dir: Path, seed: int, server_nodes: int) -
     write_json(str(path), identities)
     log(f"mapa de identidades criado em {path} ({reused} ids reaproveitados da persistencia atual)")
     return identities
+
+
+def equal_identities(identities: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Troca os node ids por ids que dividem o espaco de 64 bits em partes iguais.
+
+    O bootstrap e os servers recebem, em ordem, o meio de cada uma das
+    total_nodes partes; slots e portas continuam os do mapa. Com total_nodes
+    potencia de 2, cada no fica dono (por XOR) de exatamente 1/total_nodes do espaco.
+    """
+    entries = [identities["bootstrap"], *identities["servers"]]
+    step = (1 << NODE_ID_BITS) // len(entries)
+    renamed = [
+        {**entry, "node_id": f"{index * step + step // 2:0{NODE_ID_BITS // 4}x}"}
+        for index, entry in enumerate(entries)
+    ]
+    return {**identities, "id_scheme": "equal", "bootstrap": renamed[0], "servers": renamed[1:]}
 
 
 def identities_for(identities: Dict[str, Any], server_nodes: int) -> Dict[str, Any]:
@@ -1202,6 +1243,14 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
     sequential_files = list(files[: options.queries])
     parallel_files = list(files[: options.parallel_queries])
     identities = identities_for(identities, config.server_nodes)
+    if config.id_scheme == "equal":
+        identities = equal_identities(identities)
+        total = config.total_nodes
+        if total & (total - 1):
+            log(
+                f"ids igualmente espacados com {total} nos (nao e potencia de 2): "
+                f"as regioes XOR variam ate 2x entre os nos"
+            )
     env.Vars.SERVER_COUNT = config.total_nodes  # tamanho do pool de conexoes do fill
     out_dir = options.results_dir / config.label
 
@@ -1418,6 +1467,7 @@ def write_matrix_summary(summaries: Sequence[Dict[str, Any]], results_dir: Path)
             "status": "ok",
             "nos": config.get("server_nodes", summary.get("nodes", {}).get("servers")),
             "nos_por_container": stored_nodes_per_container(summary),
+            "ids": config.get("id_scheme", "random"),
             "embeddings": config["embeddings"],
             "replication_factor": config["replication_factor"],
             "k_size": config["k_size"],
@@ -1488,6 +1538,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--nodes", default=",".join(str(nodes) for nodes in NODE_COUNTS),
                         help=f"quantidades de nos de server da matriz, separadas por virgula "
                              f"(multiplos de --nodes-per-container)")
+    parser.add_argument("--id-scheme", default="random",
+                        help="esquema dos node ids, separados por virgula para comparar na mesma bateria: "
+                             "random (aleatorios, Kademlia original) ou equal (espaco dividido em partes iguais)")
     parser.add_argument("--nodes-per-container", type=int, default=DEFAULT_NODES_PER_CONTAINER,
                         help="nos de server por container (as rodadas antigas usavam 8)")
     parser.add_argument("--base-port", type=int, default=BOOTSTRAP_PORT,
@@ -1546,6 +1599,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     options.nodes = int_list("--nodes", options.nodes)
     options.replication_factors = int_list("--replication-factors", options.replication_factors)
     options.k_sizes = int_list("--k-sizes", options.k_sizes)
+    options.id_schemes = list(dict.fromkeys(value.strip() for value in options.id_scheme.split(",") if value.strip()))
+    if not options.id_schemes or any(value not in ID_SCHEMES for value in options.id_schemes):
+        parser.error(f"--id-scheme invalido: {options.id_scheme!r} (opcoes: {', '.join(ID_SCHEMES)})")
     if options.nodes_per_container <= 0:
         parser.error("--nodes-per-container precisa ser positivo")
     if options.fill_workers <= 0:
@@ -1595,7 +1651,7 @@ async def main_async(options: argparse.Namespace) -> int:
 
     configs = build_configs(
         options.nodes, options.embeddings, options.replication_factors, options.k_sizes,
-        options.nodes_per_container, options.base_port,
+        options.nodes_per_container, options.base_port, options.id_schemes,
     )
 
     def matches(config: Config, labels: set[str]) -> bool:
