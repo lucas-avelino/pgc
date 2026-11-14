@@ -65,6 +65,10 @@ simultaneos; um processo Python sozinho satura um nucleo):
 
     python tools/bench_matrix.py --fill-processes 4 --fill-workers 128
 
+CPU e memoria de cada no, do cliente e da maquina sao amostradas a cada
+--monitor-interval segundos (padrao 5; 0 desliga) em <grupo>/resources.csv, com a
+fase da rodada em cada linha; o resumo por fase vai para o summary.json.
+
 Rodada rapida de validacao (2 grupos, 2000 imagens no fill, 50 buscas):
 
     python tools/bench_matrix.py --only emb1024_rf2_k10_n64,emb1024_rf1_k10_n64 \
@@ -78,6 +82,7 @@ import asyncio
 import csv
 import importlib.util
 import json
+import multiprocessing
 import os
 import random
 import re
@@ -173,6 +178,7 @@ from core.client.consumer import Client  # noqa: E402
 from core.client.fill import store_chunks_parallel  # noqa: E402
 from core.client.recall import RECALL_KS, load_embeddings, measure_recall, percentile  # noqa: E402
 from core.client.utils import write_json  # noqa: E402
+from tools import resource_monitor  # noqa: E402
 
 EMBEDDINGS = {
     # sufixo -> (pasta dos embeddings, bytes por arquivo, ground truth de hamming)
@@ -620,6 +626,73 @@ def wait_dht_ready(config: Config, override: Path, timeout: int, recent_window: 
     return True
 
 
+# ---------------------------------------------------------------------- recursos
+
+
+class ResourceMonitor:
+    """
+    Liga o tools/resource_monitor.py a uma rodada: processo separado que amostra
+    CPU e memoria em <grupo>/resources.csv, marcando a fase atual.
+
+    Qualquer erro aqui so desliga o monitor; a rodada continua.
+    """
+
+    def __init__(self, interval: float, csv_path: Path) -> None:
+        self.interval = interval
+        self.csv_path = csv_path
+        self.process = None
+        self.phase_value = None
+        self.stop_event = None
+        self.summary: Dict[str, Any] | None = None
+
+    def start(self, override: Path) -> None:
+        if self.interval <= 0:
+            return
+        if not resource_monitor.supported():
+            log("monitor de recursos desligado: precisa de Linux (/proc e /sys/fs/cgroup)")
+            return
+        try:
+            ids = run_compose(override, "ps", "-q", check=False, timeout=300, quiet=True).stdout.split()
+            containers = resource_monitor.discover_containers(ids)
+            via_cgroup = sum(1 for container in containers if container["cgroup"])
+            context = multiprocessing.get_context("spawn")
+            self.phase_value = context.Value("i", resource_monitor.PHASES.index("subida"))
+            self.stop_event = context.Event()
+            self.process = context.Process(
+                target=resource_monitor.run,
+                args=(str(self.csv_path), containers, os.getpid(), self.interval, self.phase_value, self.stop_event),
+                daemon=True,
+            )
+            self.process.start()
+            log(
+                f"monitor de recursos: {len(containers)} containers ({via_cgroup} pelo cgroup, "
+                f"{len(containers) - via_cgroup} pelo /proc), amostra a cada {self.interval:g}s em "
+                f"{display_path(self.csv_path)}"
+            )
+        except Exception as error:
+            log(f"monitor de recursos desligado: {type(error).__name__}: {error}")
+            self.process = None
+
+    def phase(self, name: str) -> None:
+        if self.process is not None:
+            self.phase_value.value = resource_monitor.PHASES.index(name)
+
+    def stop(self) -> Dict[str, Any] | None:
+        if self.process is None:
+            return self.summary
+        self.stop_event.set()
+        self.process.join(timeout=max(30.0, self.interval * 3))
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join()
+        self.process = None
+        try:
+            self.summary = resource_monitor.summarize(str(self.csv_path))
+        except Exception as error:
+            log(f"nao consegui resumir {display_path(self.csv_path)}: {type(error).__name__}: {error}")
+        return self.summary
+
+
 # ------------------------------------------------------------------ ground truth
 
 
@@ -994,6 +1067,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
     out_dir.mkdir(parents=True, exist_ok=True)
     config_log = out_dir / "run.log"
     LOG_SINKS.append(config_log)
+    monitor = ResourceMonitor(options.monitor_interval, out_dir / "resources.csv")
     started_at = datetime.now(timezone.utc)
     started = time.time()
 
@@ -1023,6 +1097,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         if missing:
             raise RuntimeError(f"{len(missing)} nos nao responderam em {options.ready_timeout}s: {missing[:10]}")
         log(f"todos os {config.total_nodes} nos responderam no HTTP")
+        monitor.start(override)
 
         if not wait_dht_ready(config, override, options.dht_timeout):
             raise RuntimeError(f"a rede nao se formou em {options.dht_timeout}s (veja os logs dos containers de server)")
@@ -1034,7 +1109,9 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         hard_limit = options.fill_limit or (
             options.fill_images * config.chunks_per_image if options.fill_images else 10 ** 9
         )
+        monitor.phase("fill")
         fill = await run_fill(config, urls, out_dir, hard_limit, options.fill_workers, options.fill_processes)
+        monitor.phase("cache")
 
         # o rank_by_hamming carrega todos os embeddings na primeira busca; carregando
         # aqui, essa leitura nao cai dentro do tempo da primeira busca medida
@@ -1045,7 +1122,9 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         client = Client(urls=urls)
         try:
             log(f"rodando {len(files)} buscas sequenciais (r={options.radius})")
+            monitor.phase("sequencial")
             records, query_failures = await run_sequential(client, config, files, options.radius, options.query_timeout)
+            monitor.phase("recall")
             if not records:
                 raise RuntimeError("nenhuma busca sequencial terminou com sucesso")
 
@@ -1086,6 +1165,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
                 "failures": query_failures,
             }
             if options.concurrency > 0:
+                monitor.phase("paralelo")
                 speed["parallel"] = await run_parallel(
                     client, config, files, options.radius, options.concurrency, options.query_timeout
                 )
@@ -1093,8 +1173,10 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         finally:
             await client.close()
 
+        monitor.phase("persistencia")
         log(f"esperando {options.settle_before_down}s para os nos gravarem a persistencia")
         time.sleep(options.settle_before_down)
+        resources = monitor.stop()
         log("derrubando a rede")
         run_compose(override, "down", "--remove-orphans", "-t", "60", check=False)
 
@@ -1112,13 +1194,36 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
             "speed": {key: value for key, value in speed.items() if key != "failures"},
             "recall_hamming": {key: value for key, value in hamming.items() if key != "results"},
             "recall_clip": {key: value for key, value in clip.items() if key != "results"},
+            "resources": resources,
         }
         summary["backup_path"] = str(backup_network(config, options.networks_dir, identities, summary))
         write_json(str(out_dir / "summary.json"), summary)
         log(f"GRUPO {config.label} concluido em {summary['total_human']}")
         return summary
     finally:
+        monitor.stop()
         LOG_SINKS.remove(config_log)
+
+
+def resource_columns(resources: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Algumas colunas do monitor para o matrix_summary.csv (vazias sem monitor)."""
+    resources = resources or {}
+
+    def pick(phase: str, block: str, field: str | None) -> Any:
+        value = (resources.get(phase) or {}).get(block)
+        return value.get(field) if isinstance(value, dict) and field else value
+
+    return {
+        "cliente_cpu_max_fill": pick("fill", "client_cpu_pct", "max"),
+        "no_cpu_p95_fill": pick("fill", "node_cpu_pct", "p95"),
+        "no_cpu_max_fill": pick("fill", "node_cpu_pct", "max"),
+        "no_mais_quente_fill": pick("fill", "hottest_node", "name"),
+        "cliente_cpu_max_seq": pick("sequencial", "client_cpu_pct", "max"),
+        "no_cpu_max_seq": pick("sequencial", "node_cpu_pct", "max"),
+        "no_mem_media_mb": pick("persistencia", "node_mem_mb", "avg"),
+        "nos_mem_total_mb": pick("persistencia", "nodes_mem_total_mb", None),
+        "load1_max_fill": pick("fill", "machine_load1_max", None),
+    }
 
 
 def write_matrix_summary(summaries: Sequence[Dict[str, Any]], results_dir: Path) -> None:
@@ -1174,6 +1279,7 @@ def write_matrix_summary(summaries: Sequence[Dict[str, Any]], results_dir: Path)
             "seq_buscas_s": sequential["queries_per_second"],
             "par_buscas_s": parallel.get("queries_per_second"),
             "par_concorrencia": parallel.get("concurrency"),
+            **resource_columns(summary.get("resources")),
             "backup": summary.get("backup_path", ""),
         })
 
@@ -1227,6 +1333,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="valores de REPLICATION_FACTOR da matriz, separados por virgula")
     parser.add_argument("--k-sizes", "--k", dest="k_sizes", default=",".join(str(value) for value in K_SIZES),
                         help="valores de K_SIZE da matriz, separados por virgula")
+    parser.add_argument("--monitor-interval", type=float, default=5.0,
+                        help="segundos entre amostras de CPU/memoria em <grupo>/resources.csv (0 desliga)")
     parser.add_argument("--only", default=None, help="lista de grupos separada por virgula (ex.: emb1024_rf2_k10_n128)")
     parser.add_argument("--skip", default=None, help="lista de grupos a pular, separada por virgula")
     parser.add_argument("--force", action="store_true", help="refaz grupos que ja tem summary.json")
@@ -1271,6 +1379,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--fill-workers precisa ser positivo")
     if options.fill_processes <= 0:
         parser.error("--fill-processes precisa ser positivo")
+    if options.monitor_interval < 0:
+        parser.error("--monitor-interval nao pode ser negativo")
     largest = max(options.nodes) + 1
     if largest > HTTP_PORT_OFFSET:
         parser.error(f"com {largest} nos as portas kademlia invadiriam a faixa HTTP (+{HTTP_PORT_OFFSET})")
