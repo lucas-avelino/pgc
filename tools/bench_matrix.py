@@ -69,6 +69,20 @@ CPU e memoria de cada no, do cliente e da maquina sao amostradas a cada
 --monitor-interval segundos (padrao 5; 0 desliga) em <grupo>/resources.csv, com a
 fase da rodada em cada linha; o resumo por fase vai para o summary.json.
 
+Cada execucao grava em uma pasta propria, com o horario em que comecou:
+<results-dir>/<AAAA-MM-DD_HH-MM-SS>/<grupo>/ e as copias das redes em
+<networks-dir>/<AAAA-MM-DD_HH-MM-SS>/<grupo>/, entao nada de uma execucao anterior
+e sobrescrito. --run-name escolhe o nome da pasta; repetir o nome de uma execucao
+ja existente retoma ela, pulando os grupos que ja tem summary.json. O
+node_identities.json e a amostra de consultas continuam na raiz de cada pasta,
+compartilhados entre as execucoes.
+
+Buscas sequenciais (recall e latencia) e lote paralelo (vazao) tem quantidades
+proprias; as do lote paralelo saem da mesma amostra, entao as N primeiras sao as
+mesmas das sequenciais:
+
+    python tools/bench_matrix.py --queries 1000 --parallel-queries 5000
+
 Rodada rapida de validacao (2 grupos, 2000 imagens no fill, 50 buscas):
 
     python tools/bench_matrix.py --only emb1024_rf2_k10_n64,emb1024_rf1_k10_n64 \
@@ -1053,6 +1067,9 @@ def backup_network(config: Config, networks_dir: Path, identities: Dict[str, Any
 
 
 async def run_config(config: Config, options: argparse.Namespace, identities: Dict[str, Any], files: Sequence[str]) -> Dict[str, Any]:
+    # a amostra tem o tamanho do maior lote; cada lote usa um prefixo dela
+    sequential_files = list(files[: options.queries])
+    parallel_files = list(files[: options.parallel_queries])
     identities = identities_for(identities, config.server_nodes)
     env.Vars.SERVER_COUNT = config.total_nodes  # tamanho do pool de conexoes do fill
     out_dir = options.results_dir / config.label
@@ -1063,7 +1080,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         previous = stored_nodes_per_container(json.loads(previous_summary.read_text(encoding="utf-8")))
         if previous != config.nodes_per_container:
             set_aside(out_dir, f"{previous}-por-container")
-            set_aside(options.networks_dir / config.label, f"{previous}-por-container")
+            set_aside(options.backups_dir / config.label, f"{previous}-por-container")
     out_dir.mkdir(parents=True, exist_ok=True)
     config_log = out_dir / "run.log"
     LOG_SINKS.append(config_log)
@@ -1121,9 +1138,11 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
 
         client = Client(urls=urls)
         try:
-            log(f"rodando {len(files)} buscas sequenciais (r={options.radius})")
+            log(f"rodando {len(sequential_files)} buscas sequenciais (r={options.radius})")
             monitor.phase("sequencial")
-            records, query_failures = await run_sequential(client, config, files, options.radius, options.query_timeout)
+            records, query_failures = await run_sequential(
+                client, config, sequential_files, options.radius, options.query_timeout
+            )
             monitor.phase("recall")
             if not records:
                 raise RuntimeError("nenhuma busca sequencial terminou com sucesso")
@@ -1145,14 +1164,15 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
             sequential_wall = sum(record["wall_seconds"] for record in records)
             speed = {
                 "params": {
-                    "queries": len(files),
+                    "queries": len(sequential_files),
+                    "parallel_queries": len(parallel_files) if options.concurrency > 0 else 0,
                     "radius": options.radius,
                     "keys_per_query": config.chunks_per_image,
                     "query_timeout_seconds": options.query_timeout,
                 },
                 "fill": fill,
                 "sequential": {
-                    "queries": len(files),
+                    "queries": len(sequential_files),
                     "queries_ok": len(records),
                     "queries_failed": len(query_failures),
                     "wall_seconds": round(sequential_wall, 3),
@@ -1164,10 +1184,10 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
                 "parallel": None,
                 "failures": query_failures,
             }
-            if options.concurrency > 0:
+            if options.concurrency > 0 and parallel_files:
                 monitor.phase("paralelo")
                 speed["parallel"] = await run_parallel(
-                    client, config, files, options.radius, options.concurrency, options.query_timeout
+                    client, config, parallel_files, options.radius, options.concurrency, options.query_timeout
                 )
             write_json(str(out_dir / "speed.json"), speed)
         finally:
@@ -1196,7 +1216,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
             "recall_clip": {key: value for key, value in clip.items() if key != "results"},
             "resources": resources,
         }
-        summary["backup_path"] = str(backup_network(config, options.networks_dir, identities, summary))
+        summary["backup_path"] = str(backup_network(config, options.backups_dir, identities, summary))
         write_json(str(out_dir / "summary.json"), summary)
         log(f"GRUPO {config.label} concluido em {summary['total_human']}")
         return summary
@@ -1304,7 +1324,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Bateria de fill + recall + velocidade para cada combinacao de parametros da rede.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--queries", type=int, default=1000, help="quantidade de buscas por grupo")
+    parser.add_argument("--queries", type=int, default=1000,
+                        help="buscas sequenciais por grupo (recall e latencia)")
+    parser.add_argument("--parallel-queries", type=int, default=None,
+                        help="buscas do lote paralelo por grupo (vazao); padrao: igual a --queries")
     parser.add_argument("--radius", type=int, default=12, help="raio de hamming das buscas")
     parser.add_argument("--seed", type=int, default=42, help="seed do sorteio da amostra e dos node ids novos")
     parser.add_argument("--concurrency", type=int, default=16, help="buscas simultaneas no lote de vazao (0 desliga)")
@@ -1343,8 +1366,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="nao gera data/top500-2048 mesmo que ele nao exista")
     parser.add_argument("--compose-file", type=Path, default=COMPOSE_FILE,
                         help="compose usado para subir a rede; a topologia sai dele")
-    parser.add_argument("--results-dir", type=Path, default=REPO_ROOT / "data" / "results" / "bench")
-    parser.add_argument("--networks-dir", type=Path, default=REPO_ROOT.parent / "networks")
+    parser.add_argument("--results-dir", type=Path, default=REPO_ROOT / "data" / "results" / "bench",
+                        help="pasta base dos resultados; cada execucao grava em <results-dir>/<run-name>/")
+    parser.add_argument("--networks-dir", type=Path, default=REPO_ROOT.parent / "networks",
+                        help="pasta base das copias das redes (<networks-dir>/<run-name>/) e do node_identities.json")
+    parser.add_argument("--run-name", default=None,
+                        help="nome da pasta desta execucao (padrao: horario de inicio, AAAA-MM-DD_HH-MM-SS); "
+                             "o nome de uma execucao existente retoma ela")
     parser.add_argument("--ready-timeout", type=int, default=600, help="segundos para todos os nos responderem no HTTP")
     parser.add_argument("--dht-timeout", type=int, default=600, help="segundos para a DHT se formar")
     parser.add_argument("--settle", type=int, default=30, help="pausa depois que a rede sobe")
@@ -1395,13 +1423,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if unknown or not embeddings:
         parser.error(f"--embeddings invalido: {options.embeddings!r} (opcoes: {', '.join(EMBEDDINGS)})")
     options.embeddings = list(dict.fromkeys(embeddings))
+
+    if options.queries <= 0:
+        parser.error("--queries precisa ser positivo")
+    if options.parallel_queries is None:
+        options.parallel_queries = options.queries
+    if options.parallel_queries < 0:
+        parser.error("--parallel-queries nao pode ser negativo")
+
+    # cada execucao numa pasta propria; as bases guardam o que e compartilhado
+    # entre execucoes (node_identities.json, amostra de consultas)
+    options.run_name = options.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if not options.run_name.strip() or any(sep in options.run_name for sep in "/\\"):
+        parser.error(f"--run-name invalido: {options.run_name!r}")
+    options.results_base = options.results_dir
+    options.results_dir = options.results_base / options.run_name
+    options.backups_dir = options.networks_dir / options.run_name
     return options
 
 
 async def main_async(options: argparse.Namespace) -> int:
-    options.results_dir.mkdir(parents=True, exist_ok=True)
-    options.networks_dir.mkdir(parents=True, exist_ok=True)
-    LOG_SINKS.append(options.results_dir / "bench_matrix.log")
+    if not options.dry_run:
+        options.results_dir.mkdir(parents=True, exist_ok=True)
+        options.networks_dir.mkdir(parents=True, exist_ok=True)
+        LOG_SINKS.append(options.results_dir / "bench_matrix.log")
+    log(f"execucao {options.run_name}: resultados em {display_path(options.results_dir)}, "
+        f"copias das redes em {display_path(options.backups_dir)}")
 
     configs = build_configs(
         options.nodes, options.embeddings, options.replication_factors, options.k_sizes,
@@ -1480,8 +1527,11 @@ async def main_async(options: argparse.Namespace) -> int:
         for config in {config.embeddings: config for config in pending}.values():
             ensure_hamming_ground_truth(config)
 
-    options.sample_path = options.results_dir / f"query_sample_{options.queries}_seed{options.seed}.json"
-    files = build_query_sample(pending, options.queries, options.seed, options.sample_path)
+    # a amostra fica na pasta base: o sorteio e deterministico e as primeiras N
+    # imagens de uma amostra maior sao a amostra de N, entao serve a toda execucao
+    sample_size = max(options.queries, options.parallel_queries)
+    options.sample_path = options.results_base / f"query_sample_{sample_size}_seed{options.seed}.json"
+    files = build_query_sample(pending, sample_size, options.seed, options.sample_path)
 
     summaries: List[Dict[str, Any]] = []
     for position, config in enumerate(pending, start=1):
@@ -1509,7 +1559,7 @@ async def main_async(options: argparse.Namespace) -> int:
 
     if not options.keep_last_persist:
         reset_persistence(identities, options.base_port)
-        log("persistencia local zerada; as redes ficaram guardadas em " + str(options.networks_dir))
+        log("persistencia local zerada; as redes ficaram guardadas em " + str(options.backups_dir))
 
     write_matrix_summary(ordered_summaries(), options.results_dir)
     ok = sum(1 for summary in summaries if summary.get("status") == "ok")
