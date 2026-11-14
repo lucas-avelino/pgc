@@ -1610,9 +1610,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--fill-processes precisa ser positivo")
     if options.monitor_interval < 0:
         parser.error("--monitor-interval nao pode ser negativo")
+    # com mais de HTTP_PORT_OFFSET nos as duas faixas se sobrepoem, mas sem conflito:
+    # o kademlia usa so UDP e o HTTP so TCP, e uma porta UDP nao ocupa a TCP de mesmo numero
     largest = max(options.nodes) + 1
-    if largest > HTTP_PORT_OFFSET:
-        parser.error(f"com {largest} nos as portas kademlia invadiriam a faixa HTTP (+{HTTP_PORT_OFFSET})")
     if options.base_port < 1024 or options.base_port + HTTP_PORT_OFFSET + largest - 1 > 65535:
         parser.error(f"--base-port {options.base_port}: a faixa de portas precisa ficar entre 1024 e 65535")
     if options.nodes_per_container > 1 and "NODES_PER_PROC" not in COMPOSE_FILE.read_text(encoding="utf-8"):
