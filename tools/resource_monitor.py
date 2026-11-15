@@ -12,6 +12,12 @@ por processo do cliente e uma da maquina:
     pelo /proc;
   - maquina: /proc/stat, /proc/loadavg e /proc/meminfo.
 
+Cada CPU% usa o horario da propria leitura, nao o do inicio da amostra: com
+centenas de containers, ler todos leva uma fracao relevante do intervalo, e um
+horario so para a amostra inteira distorcia os valores (picos acima de 100% por
+no e da maquina acima do numero de nucleos). A linha da maquina leva tambem o
+contador de conntrack do namespace de rede do monitor (o mesmo do bench).
+
 cpu_pct e por cento de um nucleo (100 = um nucleo inteiro); na linha da maquina
 e a soma de todos os nucleos (3500 = 35 nucleos ocupados). mem_mb e a memoria
 anonima do container (sem cache de arquivo) ou o RSS do processo.
@@ -32,7 +38,7 @@ import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 PHASES = ("subida", "fill", "cache", "sequencial", "recall", "paralelo", "persistencia")
-CSV_FIELDS = ("time", "elapsed_s", "phase", "kind", "name", "cpu_pct", "mem_mb", "load1")
+CSV_FIELDS = ("time", "elapsed_s", "phase", "kind", "name", "cpu_pct", "mem_mb", "load1", "conntrack")
 CGROUP_ROOT = "/sys/fs/cgroup"
 
 
@@ -150,6 +156,11 @@ def client_processes(root_pid: int, exclude: int) -> Dict[int, str]:
     return found
 
 
+def conntrack_count() -> int | None:
+    text = _read("/proc/sys/net/netfilter/nf_conntrack_count")
+    return int(text) if text and text.strip().isdigit() else None
+
+
 def machine_sample() -> Tuple[float | None, float | None, float | None]:
     """(segundos de CPU ocupados somando todos os nucleos, memoria usada em bytes, load1)."""
     busy = None
@@ -207,22 +218,23 @@ def run(
             phase = PHASES[phase_value.value] if 0 <= phase_value.value < len(PHASES) else "?"
             rows = []
 
+            # cada CPU% usa o horario da propria leitura (time.monotonic logo depois de ler)
             for container in containers:
                 if container["cgroup"]:
                     seconds, memory = cgroup_sample(container["cgroup"])
                 else:
                     seconds, memory = proc_sample(container["pid"])
-                pct = cpu_pct(("no", container["name"]), seconds, now)
-                rows.append((stamp, elapsed, phase, "no", container["name"], pct, mb(memory), None))
+                pct = cpu_pct(("no", container["name"]), seconds, time.monotonic())
+                rows.append((stamp, elapsed, phase, "no", container["name"], pct, mb(memory), None, None))
 
             for pid, name in client_processes(root_pid, own_pid).items():
                 seconds, memory = proc_sample(pid)
-                pct = cpu_pct(("cliente", str(pid)), seconds, now)
-                rows.append((stamp, elapsed, phase, "cliente", name, pct, mb(memory), None))
+                pct = cpu_pct(("cliente", str(pid)), seconds, time.monotonic())
+                rows.append((stamp, elapsed, phase, "cliente", name, pct, mb(memory), None, None))
 
             busy, used, load1 = machine_sample()
-            pct = cpu_pct(("maquina", "maquina"), busy, now)
-            rows.append((stamp, elapsed, phase, "maquina", "maquina", pct, mb(used), load1))
+            pct = cpu_pct(("maquina", "maquina"), busy, time.monotonic())
+            rows.append((stamp, elapsed, phase, "maquina", "maquina", pct, mb(used), load1, conntrack_count()))
 
             # a primeira amostra de cada origem nao tem CPU (precisa de duas leituras)
             writer.writerows(row for row in rows if row[5] is not None or row[3] == "maquina")
@@ -293,6 +305,7 @@ def summarize(csv_path: str) -> Dict[str, Any]:
             "machine_cpu_pct": _stats([float(row["cpu_pct"]) for row in machine if number(row["cpu_pct"]) is not None]),
             "machine_load1_max": max((float(row["load1"]) for row in machine if number(row["load1"]) is not None), default=None),
             "machine_mem_used_mb_max": max((float(row["mem_mb"]) for row in machine if number(row["mem_mb"]) is not None), default=None),
+            "conntrack_max": max((int(float(row["conntrack"])) for row in machine if number(row.get("conntrack")) is not None), default=None),
         }
     return summary
 

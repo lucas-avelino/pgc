@@ -102,6 +102,17 @@ Esquema dos node ids (--id-scheme, tambem e eixo da matriz):
 
     python tools/bench_matrix.py --nodes 127 --id-scheme random,equal
 
+Redes grandes (~700+ nos) num namespace de rede proprio (--netns): com
+network_mode host, todo o trafego entre os nos passa pela tabela de conntrack do
+host (262144 entradas no beluga), que enche em segundos com 1024 nos e descarta
+pacotes. Num namespace criado com --network none o kernel nao rastreia as
+conexoes. Use o wrapper, que cria o namespace e roda este script dentro dele:
+
+    tools/bench_netns.sh --nodes 1023 --id-scheme equal ...
+
+O contador de conntrack (do namespace onde o bench roda) vai para o log, para o
+resources.csv e para o summary.json, nos dois modos.
+
 Rodada rapida de validacao (2 grupos, 2000 imagens no fill, 50 buscas):
 
     python tools/bench_matrix.py --only emb1024_rf2_k10_n64,emb1024_rf1_k10_n64 \
@@ -239,7 +250,7 @@ OVERRIDE_TEMPLATE = """# gerado por tools/bench_matrix.py -- grupo {label}
 # {group}
 services:
   bootstrap:
-    environment:
+{network_mode}    environment:
       LISTEN_PORT: "{base_port}"
       K_SIZE: "{k_size}"
       REPLICATION_FACTOR: "{replication_factor}"
@@ -249,7 +260,7 @@ services:
       # (o node.txt manda na porta) e a rede sobe sem ninguem na porta 4000
       PERSIST_PATH: /app/{bootstrap_persist}
   server:
-    environment:
+{network_mode}    environment:
       LISTEN_PORT: "{server_port}"
       BOOTSTRAP_ADDR: "localhost:{base_port}"
       K_SIZE: "{k_size}"
@@ -585,7 +596,7 @@ def run_compose(
     return result
 
 
-def write_override(config: Config, destination: Path) -> Path:
+def write_override(config: Config, destination: Path, netns: str | None = None) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
         OVERRIDE_TEMPLATE.format(
@@ -599,6 +610,9 @@ def write_override(config: Config, destination: Path) -> Path:
             bootstrap_persist=BOOTSTRAP_PERSIST_DIRNAME,
             base_port=config.base_port,
             server_port=config.base_port + 1,
+            # com --netns os nos entram no namespace do container que o segura,
+            # em vez do namespace do host (ver tools/bench_netns.sh)
+            network_mode=f'    network_mode: "container:{netns}"\n' if netns else "",
         ),
         encoding="utf-8",
     )
@@ -1143,6 +1157,23 @@ def set_aside(path: Path, reason: str) -> None:
     log(f"{path} guardado em {destination}")
 
 
+def read_conntrack() -> Dict[str, int] | None:
+    """Entradas de conntrack do namespace de rede deste processo (None se o kernel nao expoe)."""
+    values = {}
+    for name in ("count", "max"):
+        try:
+            values[name] = int(Path(f"/proc/sys/net/netfilter/nf_conntrack_{name}").read_text().strip())
+        except (OSError, ValueError):
+            return None
+    return values
+
+
+def format_conntrack(values: Dict[str, int] | None) -> str:
+    if not values:
+        return "indisponivel"
+    return f"{values['count']}/{values['max']} entradas ({100 * values['count'] / max(values['max'], 1):.0f}%)"
+
+
 NODE_ID_LOG_PATTERN = re.compile(r"Node id: ([0-9a-fA-F]+)")
 
 
@@ -1272,7 +1303,7 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         log(f"GRUPO {config.label} -- {config.group}")
         log("=" * 78)
 
-        override = write_override(config, out_dir / "compose.override.yml")
+        override = write_override(config, out_dir / "compose.override.yml", options.netns)
         write_json(str(out_dir / "config.json"), config.as_dict())
 
         log("derrubando qualquer rede que esteja de pe")
@@ -1305,9 +1336,13 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
         hard_limit = options.fill_limit or (
             options.fill_images * config.chunks_per_image if options.fill_images else 10 ** 9
         )
+        conntrack_before = read_conntrack()
+        log(f"conntrack antes do fill: {format_conntrack(conntrack_before)}")
         monitor.phase("fill")
         fill = await run_fill(config, urls, out_dir, hard_limit, options.fill_workers, options.fill_processes)
         monitor.phase("cache")
+        conntrack_after = read_conntrack()
+        log(f"conntrack depois do fill: {format_conntrack(conntrack_after)}")
 
         # o rank_by_hamming carrega todos os embeddings na primeira busca; carregando
         # aqui, essa leitura nao cai dentro do tempo da primeira busca medida
@@ -1408,6 +1443,8 @@ async def run_config(config: Config, options: argparse.Namespace, identities: Di
             "recall_hamming": {key: value for key, value in hamming.items() if key != "results"},
             "recall_clip": {key: value for key, value in clip.items() if key != "results"},
             "resources": resources,
+            "network": options.netns and f"netns:{options.netns}" or "host",
+            "conntrack": {"before_fill": conntrack_before, "after_fill": conntrack_after},
         }
         summary["backup_path"] = str(backup_network(config, out_dir, identities))
         write_json(str(out_dir / "summary.json"), summary)
@@ -1436,6 +1473,7 @@ def resource_columns(resources: Dict[str, Any] | None) -> Dict[str, Any]:
         "no_mem_media_mb": pick("persistencia", "node_mem_mb", "avg"),
         "nos_mem_total_mb": pick("persistencia", "nodes_mem_total_mb", None),
         "load1_max_fill": pick("fill", "machine_load1_max", None),
+        "conntrack_max_fill": pick("fill", "conntrack_max", None),
     }
 
 
@@ -1468,6 +1506,7 @@ def write_matrix_summary(summaries: Sequence[Dict[str, Any]], results_dir: Path)
             "nos": config.get("server_nodes", summary.get("nodes", {}).get("servers")),
             "nos_por_container": stored_nodes_per_container(summary),
             "ids": config.get("id_scheme", "random"),
+            "rede": summary.get("network", "host"),
             "embeddings": config["embeddings"],
             "replication_factor": config["replication_factor"],
             "k_size": config["k_size"],
@@ -1553,6 +1592,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="valores de REPLICATION_FACTOR da matriz, separados por virgula")
     parser.add_argument("--k-sizes", "--k", dest="k_sizes", default=",".join(str(value) for value in K_SIZES),
                         help="valores de K_SIZE da matriz, separados por virgula")
+    parser.add_argument("--netns", default=None,
+                        help="nome do container que segura o namespace de rede da bateria; os nos entram "
+                             "nele (network_mode container:<netns>). Use via tools/bench_netns.sh, que cria o "
+                             "namespace e roda este script dentro dele")
     parser.add_argument("--monitor-interval", type=float, default=5.0,
                         help="segundos entre amostras de CPU/memoria em <grupo>/resources.csv (0 desliga)")
     parser.add_argument("--only", default=None, help="lista de grupos separada por virgula (ex.: emb1024_rf2_k10_n128)")
@@ -1648,6 +1691,8 @@ async def main_async(options: argparse.Namespace) -> int:
         options.networks_dir.mkdir(parents=True, exist_ok=True)
         LOG_SINKS.append(options.results_dir / "bench_matrix.log")
     log(f"execucao {options.run_name}: resultados e copias das redes em {display_path(options.results_dir)}")
+    if options.netns:
+        log(f"rede da bateria no namespace do container {options.netns}; conntrack aqui: {format_conntrack(read_conntrack())}")
 
     configs = build_configs(
         options.nodes, options.embeddings, options.replication_factors, options.k_sizes,
