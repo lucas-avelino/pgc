@@ -106,9 +106,17 @@ Redes grandes (~700+ nos) num namespace de rede proprio (--netns): com
 network_mode host, todo o trafego entre os nos passa pela tabela de conntrack do
 host (262144 entradas no beluga), que enche em segundos com 1024 nos e descarta
 pacotes. Num namespace criado com --network none o kernel nao rastreia as
-conexoes. Use o wrapper, que cria o namespace e roda este script dentro dele:
+conexoes. Basta acrescentar --netns ao comando de sempre:
 
-    tools/bench_netns.sh --nodes 1023 --id-scheme equal ...
+    python tools/bench_matrix.py --nodes 1023 --id-scheme equal --netns
+
+Com --netns o script constroi a imagem dos nos, cria um container que segura o
+namespace (--network none) e se reexecuta dentro dele, num container com o socket
+e o CLI do Docker do host (o compose continua controlado daqui), --pid host e o
+cgroup do host (o monitor de CPU/memoria ve os nos como no modo normal), o
+repositorio montado no mesmo caminho e o seu usuario (os resultados ficam com o
+seu dono). Os nos entram no mesmo namespace (network_mode container:<netns>).
+O container do namespace e removido no fim.
 
 O contador de conntrack (do namespace onde o bench roda) vai para o log, para o
 resources.csv e para o summary.json, nos dois modos.
@@ -611,7 +619,7 @@ def write_override(config: Config, destination: Path, netns: str | None = None) 
             base_port=config.base_port,
             server_port=config.base_port + 1,
             # com --netns os nos entram no namespace do container que o segura,
-            # em vez do namespace do host (ver tools/bench_netns.sh)
+            # em vez do namespace do host (ver run_in_netns)
             network_mode=f'    network_mode: "container:{netns}"\n' if netns else "",
         ),
         encoding="utf-8",
@@ -1592,10 +1600,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="valores de REPLICATION_FACTOR da matriz, separados por virgula")
     parser.add_argument("--k-sizes", "--k", dest="k_sizes", default=",".join(str(value) for value in K_SIZES),
                         help="valores de K_SIZE da matriz, separados por virgula")
-    parser.add_argument("--netns", default=None,
-                        help="nome do container que segura o namespace de rede da bateria; os nos entram "
-                             "nele (network_mode container:<netns>). Use via tools/bench_netns.sh, que cria o "
-                             "namespace e roda este script dentro dele")
+    parser.add_argument("--netns", nargs="?", const=DEFAULT_NETNS, default=None, metavar="NOME",
+                        help=f"roda a bateria num namespace de rede proprio, fora do conntrack do host (redes de "
+                             f"~700+ nos); NOME e o container que segura o namespace (padrao {DEFAULT_NETNS})")
     parser.add_argument("--monitor-interval", type=float, default=5.0,
                         help="segundos entre amostras de CPU/memoria em <grupo>/resources.csv (0 desliga)")
     parser.add_argument("--only", default=None, help="lista de grupos separada por virgula (ex.: emb1024_rf2_k10_n128)")
@@ -1811,8 +1818,89 @@ async def main_async(options: argparse.Namespace) -> int:
     return 0 if ok == len(summaries) else 1
 
 
+DEFAULT_NETNS = "pgc-netns"
+NETNS_IMAGE = "pgc-bench"
+INSIDE_NETNS_ENV = "PGC_BENCH_INSIDE_NETNS"  # marca a execucao que ja esta dentro do namespace
+
+
+def run_in_netns(netns: str) -> int:
+    """
+    Reexecuta este script, com os mesmos argumentos, dentro do namespace de rede `netns`.
+
+    Constroi a imagem dos nos, cria o container que segura o namespace (--network
+    none: sem iptables, o kernel nao rastreia as conexoes) e roda o bench num
+    container que entra nele. O socket e o CLI do Docker do host vao junto (o
+    compose continua sendo controlado pelo bench), com --pid host e o cgroup do
+    host para o monitor de recursos.
+    """
+    if not hasattr(os, "getuid"):
+        raise SystemExit("--netns so funciona em Linux")
+    docker = shutil.which("docker")
+    plugin_dirs = [
+        Path.home() / ".docker/cli-plugins", Path("/usr/local/lib/docker/cli-plugins"),
+        Path("/usr/local/libexec/docker/cli-plugins"), Path("/usr/lib/docker/cli-plugins"),
+        Path("/usr/libexec/docker/cli-plugins"),
+    ]
+    compose = next((d / "docker-compose" for d in plugin_dirs if (d / "docker-compose").is_file()), None)
+    if not docker or not compose:
+        raise SystemExit("--netns precisa do docker e do plugin docker-compose (docker compose v2) no host")
+    socket_path = "/var/run/docker.sock"
+
+    def docker_cmd(*args: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.run([docker, *args], **kwargs)
+
+    log(f"--netns: construindo a imagem {NETNS_IMAGE}")
+    if docker_cmd("build", "-q", "-t", NETNS_IMAGE, str(REPO_ROOT), capture_output=True).returncode != 0:
+        raise SystemExit(f"falhou o docker build da imagem {NETNS_IMAGE}")
+    names = docker_cmd("ps", "-a", "--format", "{{.Names}}", capture_output=True, text=True).stdout.split()
+    if netns in names:
+        raise SystemExit(f"o container {netns} ja existe; remova-o (docker rm -f {netns}) ou use --netns OUTRO_NOME")
+
+    log(f"--netns: criando o namespace de rede (container {netns}, --network none)")
+    if docker_cmd("run", "-d", "--name", netns, "--network", "none", NETNS_IMAGE, "sleep", "infinity",
+                  capture_output=True).returncode != 0:
+        raise SystemExit(f"nao consegui criar o container {netns}")
+    try:
+        common = [
+            "run", "--rm",
+            "--network", f"container:{netns}",
+            "--pid", "host", "--cgroupns", "host",
+            "-v", "/sys/fs/cgroup:/sys/fs/cgroup:ro",
+            "-v", f"{socket_path}:{socket_path}",
+            "-v", f"{docker}:/usr/local/bin/docker:ro",
+            "-v", f"{compose}:/usr/local/lib/docker/cli-plugins/docker-compose:ro",
+            "-v", f"{REPO_ROOT.parent}:{REPO_ROOT.parent}",
+            "-w", str(REPO_ROOT),
+            "--user", f"{os.getuid()}:{os.getgid()}", "--group-add", str(os.stat(socket_path).st_gid),
+            "-e", "HOME=/tmp",
+            "-e", f"PYTHONPATH={REPO_ROOT / 'kademlia-lib'}:{REPO_ROOT}",
+            "-e", f"{INSIDE_NETNS_ENV}={netns}",
+            "--ulimit", "nofile=1048576:1048576",
+        ]
+        # o CLI do Docker do host tem que funcionar dentro da imagem (binario estatico)
+        if docker_cmd(*common, NETNS_IMAGE, "docker", "compose", "version", capture_output=True).returncode != 0:
+            raise SystemExit(
+                f"o 'docker compose' do host nao roda dentro da imagem {NETNS_IMAGE}; teste: "
+                f"docker run --rm -v {docker}:/usr/local/bin/docker:ro {NETNS_IMAGE} docker version"
+            )
+        tty = ["-it"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+        log(f"--netns: rodando a bateria dentro do namespace {netns}")
+        script = str(Path(__file__).resolve().relative_to(REPO_ROOT))
+        return docker_cmd(*common, *tty, NETNS_IMAGE, "python3", script, *sys.argv[1:]).returncode
+    finally:
+        log(f"--netns: removendo o container {netns}")
+        docker_cmd("rm", "-f", netns, capture_output=True)
+
+
 def main() -> int:
     options = parse_args()
+    inside = os.environ.get(INSIDE_NETNS_ENV)
+    if options.netns and not inside and not options.dry_run:
+        try:
+            return run_in_netns(options.netns)
+        except KeyboardInterrupt:
+            log("interrompido pelo usuario; a rede pode ter ficado de pe (docker compose down para derrubar)")
+            return 130
     try:
         return asyncio.run(main_async(options))
     except KeyboardInterrupt:
